@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "ZenTao",
+    "description": "Query and carefully write ZenTao products, stories, tasks and bugs. Credentials live in the DSH credential store; writes default to dryRun and require user confirmation."
+  }
+}

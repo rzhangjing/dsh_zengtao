@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "禅道 ZenTao",
+    "description": "在 DSH 里查询与受控写入禅道的产品/需求/任务/Bug。凭据走 DSH 凭据库，写入默认先 dryRun 并经用户确认。"
+  }
+}

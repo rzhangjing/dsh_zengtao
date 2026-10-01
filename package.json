@@ -1,0 +1,50 @@
+{
+  "name": "@local/dsh-plugin-zentao",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "禅道（ZenTao）企业版集成：查询与受控写入产品/需求/任务/Bug，凭据存于 DSH 凭据库",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/zh.json": "./locale/zh.json",
+    "./locale/en.json": "./locale/en.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/*.json",
+    "src/**/*.js"
+  ],
+  "scripts": {
+    "test": "node --import ./test/register-stub.mjs --test \"test/**/*.test.js\""
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-credentials": "workspace:^",
+    "@deepseek-ai/dsh-storage-domain": "workspace:^",
+    "@deepseek-ai/dsh-tools": "workspace:^",
+    "@deepseek-ai/schemastery": "^3.18.4",
+    "zod": "^4.6.5"
+  },
+  "meta": {
+    "title": "禅道 ZenTao",
+    "description": "在 DSH 里查询与受控写入禅道的产品/需求/任务/Bug。凭据走 DSH 凭据库，写入默认先 dryRun 并经用户确认。"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  }
+}

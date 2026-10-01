@@ -1,0 +1,18 @@
+# @local/dsh-plugin-zentao 的 profile patch。
+#
+# 只放"最小可用示例"：真实的站点地址与凭据由用户在设置页写入 profile patch
+# （dsh-config-editor 负责持久化）。注意一层 patch 会**整体替换** config 而不是
+# 深合并，因此本插件的每个字段都有可用默认值 —— 用户升级时不必重述。
+#
+# 单站点（D6）：没有 sites[]、没有 defaultSite。
+- insert:
+    - id: zentao
+      name: '@local/dsh-plugin-zentao'
+      config:
+        writePolicy: confirm
+        baseURL: https://zentao.example.com
+        # 只写"引用名"：账号与密码本体存在 DSH 凭据库里（设置页的"禅道"卡片可填，
+        # 也可以在启动前导出环境变量 ZENTAO_ACCOUNT / ZENTAO_PASSWORD）。
+        accountRef: ZENTAO_ACCOUNT
+        passwordRef: ZENTAO_PASSWORD
+        dialect: auto
