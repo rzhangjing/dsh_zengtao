@@ -58,6 +58,7 @@ export function apply (ctx, config) {
     getToken: () => tokenSource.get(),
     onAuthFailure: () => tokenSource?.invalidate(),
     describeAuth: () => describeAuth(ctx, getConfig()),
+    getStartupFailures: () => startupFailures,
     // 单站点 + 会话上下文：工具省略 scope 时用 `/zentao switch` 设过的产品/执行补全
     getSessionContext: () => sessionContext.get(currentSessionId(ctx)),
     logger: log,
@@ -75,6 +76,17 @@ export function apply (ctx, config) {
       done = true
       try { fn?.() } catch { /* 拆除失败不致命，别把卸载流程带崩 */ }
     }
+  }
+
+  // ── 启动期注册失败清单 ──
+  // 真机事故的**放大器**就是"注册失败被静默吞掉"：提示词变量名非法 → 注册抛错被 catch →
+  // 段落却仍引用那个变量 → 每轮组装提示词都报 malformed prompt variable reference。
+  // 现在任何注册失败都会：① 写日志 ② 进这份清单 ③ 出现在 `/zentao doctor` 里。
+  const startupFailures = []
+  const recordStartupFailure = (area, error) => {
+    const message = String(error?.message ?? error ?? '未知错误')
+    startupFailures.push({ area, message })
+    log(`注册失败（${area}）：${message}`)
   }
 
   // ── L4：工具、写入门禁、命令 ──
@@ -112,7 +124,11 @@ export function apply (ctx, config) {
     return once(off)
   }, 'zentao: skill')
 
-  const offPrompt = registerZentaoPrompt(ctx, getConfig)
+  const offPrompt = registerZentaoPrompt(ctx, getConfig, {
+    onFailure: (area, error) => {
+      recordStartupFailure(area, error)
+    },
+  })
   ctx.effect(() => once(offPrompt ?? (() => {})), 'zentao: prompt section')
 
   // ── 可选服务：授权流（需要 credentials + authorization）──

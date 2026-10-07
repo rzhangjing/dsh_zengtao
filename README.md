@@ -16,8 +16,8 @@ DeepSeek Harness 的**禅道（ZenTao）企业版**插件。让 Agent 能查询�
 |---|---|
 | Host 半 + Client 半实现 | ✅ 完成（5 个工具 / 1 个命令 + 7 子命令 / 1 个技能 / 提示词段 2 变量 / 会话投影 / 设置卡片 / 会话卡片 / 全屏看板 + 侧栏入口） |
 | 全部源文件语法 | ✅ 48 个 JS/MJS 文件 `node --check` 通过 |
-| 离线单元测试 | ✅ **342 项全绿**（`npm test`，不需要禅道） |
-| 真实包契约测试 | ✅ **16 项全绿**（真实 schemastery/defineTool/defineDomain/zod、真实补丁与 profile 装载器、**真实 Cordis 框架**） |
+| 离线单元测试 | ✅ **353 项全绿**（`npm test`，不需要禅道） |
+| 真实包契约测试 | ✅ **17 项全绿**（真实 schemastery/defineTool/defineDomain/zod、真实补丁与 profile 装载器、**真实 Cordis 框架**） |
 | §7.6 六项待实测校准 | ✅ 全部有定论（4 项确证 / 1 项确证"参数不存在" / 1 项配置级取证），其中端点路径、网页深链、请求参数三项是**运行级实证** |
 | §14.2 M1 / M2 / M4 / M6 | ✅ 达成（含**真机**幂等、并发冲突、写入回读、软删除证据） |
 | §14.2 M5 | ✅ 已实现（会话卡片 + 全屏看板 + 侧栏入口）；**视觉待装载后确认** |
@@ -204,12 +204,12 @@ zentao_write(action="update", entity="task", id="18", payload={patch:{pri:1}}, d
 ## 开发
 
 ```bash
-npm test    # 342 项离线测试，不需要禅道
+npm test    # 353 项离线测试，不需要禅道
 ```
 
 ### 两套测试
 
-1. **`npm test`（342 项，自包含）** —— 用 `test/stubs/dsh.mjs` 替换 `@deepseek-ai/*` 与 `zod`，
+1. **`npm test`（353 项，自包含）** —— 用 `test/stubs/dsh.mjs` 替换 `@deepseek-ai/*` 与 `zod`，
    因此**不需要安装 DSH 也能跑**。其中 `test/assembly.test.js` 会真的 import `index.js` 并驱动
    `apply()`，顺带把工具定义当 schema linter 校验；`test/client.test.js` 用**有状态**的 React 桩
    真的渲染三个客户端组件并**驱动交互路径**（保存被接受/被拒绝/抛错/内存模式、看板的会话发现与收起展开），

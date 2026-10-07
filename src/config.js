@@ -11,10 +11,15 @@
  * 而自建 Agent 会静默绕过 `dsh-http-proxy`（DSH 明令禁止，且有门禁检查）。
  * 因此自签名内网证书的正解是**在启动 DSH 之前**设置 `NODE_EXTRA_CA_CERTS`
  * 指向企业根证书；`/zentao doctor` 会如实报告该变量是否设置。
+ *
+ * ⚠️ `baseURL` 会经过 `normalizeBaseURL` 规范化：用户常从浏览器地址栏复制页面地址
+ * （`http://host/zentao/my.html`），直接拼 API 会变成 `…/my.html/api.php/…`（必然失败）。
+ * 规范化只裁掉页面尾巴，保留真实子目录。
  */
 
 import z from '@deepseek-ai/schemastery'
 import { DIALECT_IDS } from './transport/dialects/index.js'
+import { normalizeBaseURL } from './domain/url.js'
 
 export const Config = z.object({
   // ── 站点（单站点，扁平字段）─────────────────────────────
@@ -77,7 +82,8 @@ export function snapshotConfig (config) {
     return field
   }
   return {
-    baseURL: value(config.baseURL, ''),
+    // 规范化：从浏览器复制来的页面地址（…/my.html、…/index.php?m=…）会被裁成站点根。
+    baseURL: normalizeBaseURL(value(config.baseURL, '')),
     label: value(config.label, '禅道'),
     accountRef: value(config.accountRef, 'ZENTAO_ACCOUNT'),
     passwordRef: value(config.passwordRef, 'ZENTAO_PASSWORD'),

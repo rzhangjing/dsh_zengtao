@@ -83,11 +83,13 @@ function todayIso (date = new Date()) {
  * @param {() => Promise<string|undefined>} deps.getToken 取一个可用 Token（认证实现在 auth.js）
  * @param {() => void} [deps.onAuthFailure] 收到 401 时回调：用来丢掉已缓存的 Token，下次自动重换
  * @param {() => Promise<object>} [deps.describeAuth] 诊断用：报告账号/密码凭据是否配置（**不含值**）
+ * @param {() => Array<{area: string, message: string}>} [deps.getStartupFailures] 诊断用：启动期注册失败清单
  */
 export function createService (deps) {
   const { transport, store, locks, getConfig, getToken, getSessionContext } = deps
   const onAuthFailure = typeof deps.onAuthFailure === 'function' ? deps.onAuthFailure : () => {}
   const describeAuth = deps.describeAuth
+  const getStartupFailures = deps.getStartupFailures
   const log = deps.logger ?? (() => {})
 
   /** 方言实例缓存（探测结论变了就重建）。 */
@@ -1337,6 +1339,15 @@ export function createService (deps) {
     const token = await getToken().catch(() => undefined)
     facts.tokenConfigured = Boolean(token)
     lines.push(`换取 Token：${token ? '成功（仅内存缓存，不落盘）' : '未成功（缺凭据或账号密码不被接受）'}`)
+    // 启动期注册失败：这类问题曾经"静默吞掉"，最后以**每一轮都报错**的形式暴露（真机事故）。
+    // 现在它是一眼可见的一行。
+    if (typeof getStartupFailures === 'function') {
+      const failures = getStartupFailures()
+      if (Array.isArray(failures) && failures.length > 0) {
+        lines.push(`启动期注册失败：${failures.length} 项（这些能力当前不生效）`)
+        for (const failure of failures) lines.push(`  · ${failure.area}：${failure.message}`)
+      }
+    }
     lines.push(`写入策略：${config.writePolicy}`)
     lines.push(`批量写：${config.allowBulkWrite ? `开启（上限 ${config.maxBulkItems}）` : '关闭'}`)
     lines.push(`TLS：证书校验始终开启（自签名内网请用 NODE_EXTRA_CA_CERTS 注入企业根证书）`)

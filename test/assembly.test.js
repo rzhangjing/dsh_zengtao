@@ -13,6 +13,7 @@ import { readFileSync } from 'node:fs'
 
 import { materializeConfig } from './stubs/dsh.mjs'
 import { classifyCall, decideWrite } from '../src/domain/policy.js'
+import { registerZentaoPrompt } from '../src/prompt.js'
 
 const indexModule = await import('../index.js')
 const { Config, snapshotConfig } = await import('../src/config.js')
@@ -35,7 +36,16 @@ function makeCtx (available = {}) {
     skills: { register: (skill) => { rec.skills.push(skill); return removeOnDispose(rec.skills, skill) } },
     systemPrompt: {
       section: (section) => { rec.sections.push(section); return removeOnDispose(rec.sections, section) },
+      // **像真实实现一样校验变量名**（真机血泪：注册时校验、组装时才炸的是"引用"）。
+      // 真实规则与报错文本见 dsh-system-prompt/lib/index.js:59,166,298：
+      //   const VARIABLE_NAME = /^[a-z][a-z0-9_]*$/
+      //   throw new Error(`invalid prompt variable name "${name}" (must match ${String(VARIABLE_NAME)})`)
+      // 桩以前不校验，于是 `zentaoStatus` 这种非法名字在离线套件里一路绿灯，
+      // 到真机就让**每一轮**都以 malformed prompt variable reference 收尾。
       variable: (name, resolve) => {
+        if (!/^[a-z][a-z0-9_]*$/.test(String(name))) {
+          throw new Error(`invalid prompt variable name "${name}" (must match /^[a-z][a-z0-9_]*$/)`)
+        }
         const entry = { name, resolve }
         rec.variables.push(entry)
         return removeOnDispose(rec.variables, entry)
@@ -182,6 +192,28 @@ test('apply：写了 pre-execute 门禁监听器，且真的能拦下写入', as
   assert.equal(denied.info.code, 'WRITE_DISABLED')
 })
 
+test('写入门禁：**与禅道无关的工具必须原样落回下游**（否则会卡住所有工具调用）', async () => {
+  // 这是与"提示词悬空引用"同级的风险：门禁挂在所有工具调用的 waterfall 上，
+  // 只要它对无关工具返回了别的形状（或忘了调 next），**每个会话的每次工具调用**都会出问题。
+  // 用 readonly 这种"最激进"的策略来测：无关工具也不该受到任何影响。
+  const { rec } = applyPlugin({}, { baseURL: 'https://zt.example.com', writePolicy: 'readonly' })
+  const entry = rec.listeners.find((item) => item.event === 'tools/pre-execute')
+  assert.ok(entry)
+
+  let reached = 0
+  const next = async () => { reached += 1; return { kind: 'allow', from: 'next' } }
+  const unrelated = [
+    'pwsh', 'read', 'edit', 'glob',
+    'zentao_queryX', // 前缀相同但不是我注册的工具名 —— 不能被误判
+    'zentao_board2',
+  ]
+  for (const name of unrelated) {
+    const result = await entry.listener({ name, arguments: { command: 'echo hi' } }, next)
+    assert.deepEqual(result, { kind: 'allow', from: 'next' }, `${name} 必须原样落回下游`)
+  }
+  assert.equal(reached, unrelated.length, '每个无关工具都必须真的调到 next()')
+})
+
 test('apply：confirm 策略下写入返回 ask，并带上人看得懂的变更说明', async () => {
   const { rec } = applyPlugin({}, { baseURL: 'https://zt.example.com', writePolicy: 'confirm' })
   const entry = rec.listeners.find((item) => item.event === 'tools/pre-execute')
@@ -258,9 +290,46 @@ test('apply：注册技能与提示词段，且提示词文本逐次一致（不
   assert.doesNotMatch(section.text, /\d{4}-\d{2}-\d{2}/, '不得含时间戳（会毁掉缓存前缀）')
   assert.match(section.text, /不可信数据/)
 
-  // 两个变量可解析
-  assert.deepEqual(first.rec.variables.map((item) => item.name).sort(), ['zentaoStatus', 'zentaoWritePolicy'])
-  assert.match(first.rec.variables.find((item) => item.name === 'zentaoStatus').resolve(), /公司|已接入|尚未配置/)
+  // 变量名必须全小写（真机血泪：`zentaoStatus` 让每一轮都以 malformed prompt variable 收尾）
+  assert.deepEqual(first.rec.variables.map((item) => item.name).sort(), ['zentao_status', 'zentao_write_policy'])
+  for (const variable of first.rec.variables) {
+    assert.match(variable.name, /^[a-z][a-z0-9_]*$/, `变量名 ${variable.name} 违反 DSH 规则（只允许小写）`)
+  }
+  assert.match(first.rec.variables.find((item) => item.name === 'zentao_status').resolve(), /已接入|尚未配置/)
+})
+
+test('提示词：段落文本里的每个 {{变量}} 都必须是**真的注册成功**的变量（否则每一轮都会炸）', () => {
+  const { rec } = applyPlugin({}, { baseURL: 'https://zt.example.com' })
+  const section = rec.sections[0]
+  const declared = new Set(rec.variables.map((item) => item.name))
+  const referenced = [...String(section.text).matchAll(/\{\{([^}]*)\}\}/g)].map((match) => match[1])
+  assert.ok(referenced.length > 0, '这一段本来就该带变量，否则这个测试没有意义')
+  for (const name of referenced) {
+    assert.ok(declared.has(name),
+      `段落引用了 {{${name}}}，但它没有被注册 —— DSH 在组装时会抛 malformed prompt variable reference，` +
+      '而插件是 profile 级的，那会让**每个会话的每一轮**都以 error 收尾')
+  }
+})
+
+test('提示词：变量注册被服务拒绝时（真实现会为非法名字抛错），段落**不得**留下悬空引用', () => {
+  // 用一个"只接受合法小写名字、其余一律抛错"的服务模拟真实实现
+  const rec = { sections: [], variables: [] }
+  const systemPrompt = {
+    section: (section) => { rec.sections.push(section); return () => {} },
+    variable: (name, resolve) => {
+      if (!/^[a-z][a-z0-9_]*$/.test(String(name))) throw new Error('invalid prompt variable name')
+      rec.variables.push({ name, resolve })
+      return () => {}
+    },
+  }
+  const ctx = { get: (name) => (name === 'systemPrompt' ? systemPrompt : undefined) }
+  registerZentaoPrompt(ctx, () => ({ baseURL: 'https://zt.example.com', label: 'X', writePolicy: 'confirm' }))
+
+  assert.equal(rec.sections.length, 1)
+  const referenced = [...String(rec.sections[0].text).matchAll(/\{\{([^}]*)\}\}/g)].map((m) => m[1])
+  for (const name of referenced) {
+    assert.ok(rec.variables.some((v) => v.name === name), `悬空引用 {{${name}}} 会让每一轮都失败`)
+  }
 })
 
 test('apply：可选服务通过 ctx.inject 惰性接入，且回调可安全执行', () => {

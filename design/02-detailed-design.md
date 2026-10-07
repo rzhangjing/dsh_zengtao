@@ -2583,3 +2583,73 @@ if (!observed.committed) throw new AuthorizationError('… resolved without comm
 名称找不到要附清单、编号不存在要附清单、无产品时的文案、USAGE 必须写明"不带参数会列出所有产品与编号"。
 
 测试：桩套件 335 → **342**。
+### C.38 第三十四轮：**严重事故** —— 插件一启用就让 DSH 所有会话的每一轮都失败
+
+用户报告：*"插件有问题，只要开启了，导致 dsh 所有任务中断了"*。这是我的 bug，性质是**把整个 harness 拖垮**，不是插件自己不好用。
+
+**1. 根因（有完整证据链）**
+
+我在 `src/prompt.js` 里把提示词变量命名为 **`zentaoStatus` / `zentaoWritePolicy`**（含大写），而 DSH 只允许
+`/^[a-z][a-z0-9_]*$/`。真实实现（`dsh-system-prompt/lib/index.js`）：
+
+```js
+const VARIABLE_NAME = /^[a-z][a-z0-9_]*$/;                       // L59
+variable(name, provider) {                                        // L297
+  if (!VARIABLE_NAME.test(name)) throw new Error(`invalid prompt variable name "${name}" …`)   // L298 注册时就抛
+}
+function interpolate(input, variables, kind) {                     // L155 渲染时校验引用
+  if (!VARIABLE_NAME.test(name)) throw new Error(`malformed prompt variable reference "{{${name}}}" in ${kind} "${input.name}"`)  // L166
+  if (!Object.hasOwn(variables, name)) throw new Error(`unknown prompt variable "{{${name}}}" …`)                               // L167
+}
+```
+
+于是发生**三连**：
+1. `variable('zentaoStatus', …)` 在注册时抛错 → 被我的 `try/catch` **静默吞掉**；
+2. `section({ text: '…{{zentaoStatus}}…' })` 注册成功（文本的校验发生在渲染阶段）；
+3. **每一次组装提示词**（也就是每一轮）都抛 `malformed prompt variable reference` → `turn/end` 直接是 error。
+
+因为插件是 **profile 级**的，受害面是**所有工作区的所有会话**。用户会话记录里的原文（从
+`~/.dsh/sessions/…/session.v4.jsonl.zstd` 解出，多帧 zstd 需按帧魔数切分）：
+
+```
+turn/end turn:15..18 reason={"kind":"error","error":{"message":
+  "malformed prompt variable reference \"{{zentaoStatus}}\" in section \"zentao:context\"
+   (variable names match /^[a-z][a-z0-9_]*$/)","code":"UNKNOWN"}}
+```
+
+**2. 为什么我的测试没抓到（同一个老毛病：桩不忠实）**
+
+`test/assembly.test.js` 的桩 `variable(name, resolve)` **不校验名字**，于是非法名在离线套件里一路绿灯；
+而真实契约套件当时**根本没有覆盖提示词渲染**这条路径。这与之前几次（`peerDependencies`、
+`client.inject`、`authorization.begin`）是同一类：**宿主侧契约只靠"我以为"而不是"对着真实实现验证"**。
+
+**3. 修复（四层，缺一层都不够）**
+
+| 层 | 做法 |
+|---|---|
+| 改名 | `zentao_status` / `zentao_write_policy`，并导出 `PROMPT_VARIABLE_NAME` 常量把规则写进代码 |
+| **只引用注册成功的变量** | 段落文本按"实际注册成功集合"拼装；一个都没成功就退化成静态文案 —— **任何注册失败都不可能再留下悬空引用** |
+| 注册前自检 | 名字不合法直接跳过注册（宁可少一段提示词，也不能让 harness 每轮失败） |
+| **不再静默吞掉** | 失败的注册：写日志 + 进"启动期注册失败"清单 + **`/zentao doctor` 显示出来** |
+
+另外补了一条同类风险守卫：门禁钩子挂在**所有**工具调用的 waterfall 上，所以断言
+**与禅道无关的工具必须原样落回下游**（`pwsh`/`read`/`zentao_queryX` 等）——这类错误同样会"卡住一切"。
+
+**4. 验证**
+
+- 变异检查：把变量名改回 `zentaoStatus` → 离线套件 **4 项**失败、真实契约 **2 项**失败（两个套件都能拦住）；
+- **真实契约新增**：用真实 `SystemPrompt` 注册 → `await assemble({})` → `renderPrompt(assembly)`（真机出错的那条路径）必须不抛错、变量被展开、且**不残留 `{{`**；
+- 桩已改成与真实实现同样校验变量名；
+- 插件的 `apply` 现在把所有注册失败都记进清单，doctor 会打印。
+
+测试：桩套件 342 → **352**；真实包契约 16 → **17**。
+
+**5. 善后**
+
+用户 profile 已恢复成"未启用该插件"的状态（`dsh.profile.bundles` 里没有本包 = 插件页取消勾选的效果），
+用户的 profile 补丁也顺手修正并备份（`%TEMP%\dsh-zentao-probe\profile-patch-backup-20261007-202617`）：
+`baseURL` 由浏览器页面地址 `…/zentao/my.html` 改为站点根、`dialect: rest-v2`（未实现占位）改为 `auto`、
+移除已废弃的 `tokenRef`。
+
+**教训（写给自己）**：凡是"注册到宿主、且宿主会在每轮/每次调用时使用"的东西（提示词变量、门禁钩子），
+都必须①对着真实实现验证名字与形状，②失败时宁可**不注册**也不能留下悬空引用，③失败必须留痕。

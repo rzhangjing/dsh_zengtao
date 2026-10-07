@@ -450,6 +450,41 @@ test('真实 dsh-authorization：begin 必须收 { key }，且流程必须在 re
   dispose()
 })
 
+test('真实 systemPrompt：本插件的提示词段落必须能真的渲染出来', { skip }, async () => {
+  // 这条测试是为了一个**真机事故**：插件曾把变量命名为 `zentaoStatus`（含大写），
+  // 真实现只允许 /^[a-z][a-z0-9_]*$/ —— 注册时抛的错被我们的 catch 吞掉，而**引用**非法变量名的
+  // 错误发生在渲染时（interpolate），于是**每个会话的每一轮**都以
+  // `malformed prompt variable reference "{{zentaoStatus}}"` 收尾（用户侧表现为"任务全中断"）。
+  const { Context } = await import('@deepseek-ai/cordis')
+  const { SystemPrompt, renderPrompt } = await import('@deepseek-ai/dsh-system-prompt')
+  const { registerZentaoPrompt } = await import('../src/prompt.js')
+
+  const ctx = new Context()
+  ctx.plugin(SystemPrompt)
+  for (let i = 0; i < 50 && (ctx.systemPrompt ?? ctx.get('systemPrompt')) === undefined; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  const systemPrompt = ctx.systemPrompt ?? ctx.get('systemPrompt')
+  assert.ok(systemPrompt, '真实 systemPrompt 服务应当挂上')
+
+  const dispose = registerZentaoPrompt(ctx, () => ({
+    baseURL: 'http://127.0.0.1/zentao',
+    label: '本机禅道',
+    writePolicy: 'confirm',
+  }))
+  assert.equal(typeof dispose, 'function', '应当返回 disposer')
+
+  const assembly = await systemPrompt.assemble({})
+  let rendered
+  // 这一步就是真机每轮失败的地方：非法的/悬空的 {{引用}} 会在这里抛错
+  assert.doesNotThrow(() => { rendered = renderPrompt(assembly) })
+  assert.match(rendered, /本机禅道/, '变量应当被展开成实际值')
+  assert.match(rendered, /confirm/, '写入策略变量也应当展开')
+  assert.doesNotMatch(rendered, /\{\{/, '不该留下任何未展开的引用')
+
+  dispose()
+})
+
 test('真实装载器：把本包当 profile bundle 装进一个 profile 后，能解析出它的补丁层并正确组合', { skip }, async () => {
   const boot = await import('@deepseek-ai/dsh-app-boot')
   const fs = await import('node:fs')

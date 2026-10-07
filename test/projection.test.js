@@ -90,6 +90,29 @@ test('apply：忽略的事件与"同值 switch"都必须返回同一引用', () 
   assert.equal(definition.apply(once, { type: 'command/done', data: { rawInput: 'switch 12 34' } }), once)
 })
 
+test('apply 绝不抛错：脏事件 / 异常形状都必须原样返回（投影抛错会牵连会话事件处理）', () => {
+  // 投影的 apply 跑在会话事件流上，是**每个会话的每个事件**都会经过的地方。
+  // 它抛错就不再是"禅道卡片不更新"这种局部故障，而会牵连宿主的事件处理 ——
+  // 与"提示词悬空引用"同级的风险，所以这里把"不抛"钉住。
+  const { definition } = makeProjection()
+  const state = definition.init()
+  const garbage = [
+    undefined, null, 0, '', 'nope', [], {},
+    { type: 'command/run' },
+    { type: 'command/run', data: null },
+    { type: 'command/run', data: { rawInput: null } },
+    { type: 'command/run', data: { rawInput: { toString () { throw new Error('boom') } } } },
+    { type: 'command/run', data: { text: 'switch 12' } },
+    { type: 'tool/result', data: { rawInput: 'switch 12' } },
+  ]
+  for (const event of garbage) {
+    assert.doesNotThrow(() => definition.apply(state, event), `apply 不该对 ${JSON.stringify(event)} 抛错`)
+  }
+  // 单个坏事件之后，正常事件仍然要工作（状态没被污染）
+  const after = definition.apply(state, { type: 'command/run', data: { rawInput: 'switch 7 8' } })
+  assert.equal(after.productId, '7')
+})
+
 test('apply 是日志的**纯函数**：同一份日志重放出完全相同状态（状态里没有 wall-clock）', () => {
   const { definition } = makeProjection()
   const events = [
