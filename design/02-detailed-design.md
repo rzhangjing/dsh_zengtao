@@ -2281,6 +2281,8 @@ const fiber = ctx.plugin(await import('index.js'), { baseURL, tokenRef, writePol
 
 测试：桩套件 317 → **318**；真实包契约 14 → **15**。
 
+> 已作废的结论（保留以示诚实）：C.32 把 log_effort 记为"已实测确认"是**错的** —— 详见 C.44。
+
 ### C.32 第二十八轮：doctor 清单的来源修正（并因此补上需求指派）
 
 用户在本机执行 `/zentao doctor` 时（插件尚未装载，命令落到我这边），我直接调插件的 doctor 逻辑打了真实实例，输出里发现一行**误导**：
@@ -2653,3 +2655,447 @@ turn/end turn:15..18 reason={"kind":"error","error":{"message":
 
 **教训（写给自己）**：凡是"注册到宿主、且宿主会在每轮/每次调用时使用"的东西（提示词变量、门禁钩子），
 都必须①对着真实实现验证名字与形状，②失败时宁可**不注册**也不能留下悬空引用，③失败必须留痕。
+### C.39 第三十五轮：官方 CLI 与官方 MCP 服务接入（第 2 项完成）
+
+用户问"禅道有没有 CLI"并选择三件事：装通官方 CLI、把它的 MCP 接进 DSH、把插件升级到 API 2.0。
+
+**1. 官方确实有 CLI（核实过，不是传闻）**
+
+| 项 | 事实 |
+|---|---|
+| 包 | `zentao-cli`（npm，最新 **0.3.1**，MIT，Node ≥18，bin=`zentao`） |
+| 作者/仓库 | `Sun Hao <sunhao@chandao.com>`（禅道官方）· github.com/easysoft/zentao-cli |
+| 官方公告 | 禅道产品动态「禅道命令行 ZenTao CLI 发布…」（页面标注 2026-05-06） |
+| 官方技能仓库 | github.com/easysoft/zentao-skills → `skills/zentao-cli/SKILL.md`（v0.3.1） |
+| 适用版本 | 开源 21.7.8 / 企业 12.7 / 旗舰 7.7 / **IPD 4.7+**（本机 IPD 5.6 ✓） |
+
+本机装法：`npm install -g zentao-cli`（全局目录 `D:\Program Files\nodejs\node_global`）。
+真机验证（**不落盘密码**，用官方文档给的环境变量方式）：
+
+```
+ZENTAO_URL=http://127.0.0.1/zentao  ZENTAO_ACCOUNT=admin
+zentao product --pick=id,name      → {"data":[{"id":"1","name":"DSH插件校准测试"}],"pager":{...}}
+zentao task --executionID=2 …      → 7 条任务
+zentao bug --product=1 …           → 1 条
+zentao story --product=1 …         → 5 条
+zentao my tasks / my todos         → 空（admin 名下确实没有）
+zentao version                     → Zentao CLI: 0.3.1
+```
+
+**2. 官方 MCP 服务：直接驱动验证通过**
+
+`zentao mcp` 是标准 MCP stdio 服务。我用**官方 MCP SDK** 写了个探针直接连它：
+
+```
+✓ 已连上 MCP 服务
+工具数 = 29
+  zentao_action_help / zentao_profile / zentao_switch_profile
+  zentao_product / project / execution / story / epic / requirement / task / bug / …（按模块）
+▸ zentao_product {"action":"list"}            → 真实产品数据（id=1）
+▸ zentao_task    {"action":"list","execution":2} → 真实任务数据（id=9…）
+▸ zentao_action_help {"module":"task","action":"finish"}
+   → { path: "/tasks/{taskID}/finish", minVersion:["22.0","biz13.0","max8.0","ipd5.0"], parameters:[…] }
+```
+
+注意工具是**动作式**的（`zentao_<模块>` + `action` 参数），且参数名与注册表里的**路径参数名不同名**
+（`task.list` 的路径参数叫 `executionID`，MCP 侧要传 `execution`）——官方提供的 `zentao_action_help`
+工具就是用来发现这些的。
+
+**3. 接进 DSH 的做法（已写入用户 profile 补丁）**
+
+DSH 自带 `@deepseek-ai/dsh-mcp-client`（官方文档：每台服务器一条配置项，工具名形如
+`mcp__<serverName>__<tool>`）。写入 `~/.dsh/profiles/desktop/cordis.patch.yml`：
+
+```yaml
+- insert:
+    - id: mcp-zentao
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        serverName: zentao
+        transport: stdio
+        command: 'D:\Program Files\nodejs\node.exe'
+        args: ['D:\Program Files\nodejs\node_global\node_modules\zentao-cli\bin\zentao.js', 'mcp']
+        env:
+          ZENTAO_URL: http://127.0.0.1/zentao
+          ZENTAO_ACCOUNT: !!js process.env.ZENTAO_ACCOUNT
+          ZENTAO_PASSWORD: !!js process.env.ZENTAO_PASSWORD
+        failOnStartupError: false
+```
+
+三处刻意的选择（都核过真实实现）：
+- **密码不写进文件**：用 `!!js process.env.…`；更推荐先在终端跑一次 `zentao login`（CLI 自己存凭据），那样 env 整段可删；
+- `failOnStartupError: false`（默认）：连不上只影响这个 MCP 自己，**不拖累 harness 启动** —— 刚经历过"插件拖垮 harness"，这条不能再犯；
+- `buildChildEnv` 是 `{...scrubbedParentEnv(), ...extra}`：DSH 会**洗掉子进程继承的凭据**，而显式给的值在其之上注入；另外实测 **Node 会跳过值为 undefined 的 env**，所以环境变量没设时也不会炸（子进程里就是未定义）。
+
+用官方 loader 复验补丁可解析（`loadOverlayPatches('dsh', <profile>/cordis.patch.yml)` → 6 个条目，
+`insert(1)` 里就是 `mcp-zentao`）。**生效需要重启 DSH**（MCP 连接在启动时建立）。
+
+### C.40 第三十六轮：v2 数据层落地（第 3 项第一步）
+
+**权威契约的来源**：官方 SDK 包 `zentao-api@0.7.0`（随 `zentao-cli` 发布，MIT）里的
+`dist/modules/generated.js` —— 26 个模块、**228 个动作**，每个动作带 `method`/`path`/
+`minVersion`（含 `ipd5.x` 系列门槛）/`resultGetter`/`pagerGetter`/`pathParams`/`params`。
+官方 CLI 就是照它判断"这个动作在你这台服务器上能不能用"。
+
+我写了 `scripts/gen-rest-v2-routes.mjs` 把它**裁剪**成 `src/transport/dialects/rest-v2.routes.js`
+（77.5KB，只保留判定所需字段），并记录来源版本，便于日后重新生成。**自动生成，不手改。**
+
+关键路径（已核对）：
+
+| 动作 | v2 路径 | 门槛 |
+|---|---|---|
+| 任务列表 | `GET /executions/{executionID}/tasks` | ipd5.0 |
+| 任务 开始/完成/关闭/激活 | `PUT /tasks/{taskID}/start|finish|close|activate` | ipd5.0 |
+| 需求列表 | `GET /{scope}/{scopeID}/stories` | ipd5.0 |
+| 需求 激活/变更/关闭 | `PUT /stories/{storyID}/activate|change|close` | ipd5.0 |
+| Bug 列表 | `GET /{scope}/{scopeID}/bugs` | ipd5.0 |
+| Bug 解决/关闭/确认 | `PUT /bugs/{bugID}/resolve|close|confirm` | ipd5.0 / confirm 需 ipd5.5 |
+| **我的** | `GET /my/tasks|bugs|todos|stories|…` | **ipd5.5**（本机 5.6 ✓） |
+| 产品计划 | `GET /products/{productID}/productplans` | ipd5.0 |
+
+**两条重要发现（决定了实现方式）**：
+1. **v2 没有 `tokens` 端点**（注册表里没有 token 模块；实测 `POST /api.php/v2/tokens` 落到网页端）。
+   但**v1 换来的 Token 对 v2 请求有效**（我的全部 v2 探测都是这么做的）→ 取 Token 永远走 v1；
+2. **v2 注册表里没有 assign / estimate / comment / effort 动作** → 指派、登记工时在 v2 只能通过
+   `PUT /tasks/{id}` 之类**更新字段**表达，具体字段必须**真机校准**后才能写进插件（不能猜）。
+
+**版本探测**：`GET /?mode=getconfig` → `{"version":"ipd5.6", …}`（实测）。v2 方言将用它做门禁：
+动作要求的 `ipdX.Y` 高于服务器版本时，报可读错误而不是让它 404。
+
+**下一步**：实现 `src/transport/dialects/rest-v2.js`（复用 v1 的 auth/错误解析 + 用生成的表覆盖
+列表/详情/写入/信封解析），然后逐条真机校准（含上面那两条待定项），最后才把 profile 的
+`dialect` 切到 v2。
+### C.41 第三十七轮：v2 方言落地 + 真机校准（第 3 项主体完成）
+
+**实现方式**（刻意"复用 + 覆盖"，不是重写）：
+- 认证头、错误解析、详情解包兜底、网页链接、**写操作的字段语义**全部沿用 v1（那些是逐条实测过的）；
+- **路径与方法**来自官方注册表 `rest-v2.routes.js`（26 模块 / 228 动作，自动生成）；
+- 注册表里**没有**的动作（assign / log_effort / comment）**回退 v1 已校准端点**，并在 spec 上带
+  `basePath: '/api.php/v1'`（service 新增"按调用覆盖基址"的逃生口）——宁可走已验证的 v1 形状，也不凭空猜 v2 字段；
+- 取 Token **固定走 v1**（`dialect.tokenBasePath`）：v2 无 tokens 端点，而 v1 换来的 Token 对 v2 请求有效。
+
+**真机校准结果（本机 IPD 5.6，逐条对照 v1）**
+
+| 项目 | v1 | v2 | 结论 |
+|---|---|---|---|
+| 产品 / 项目 / 用户 / Bug 列表 | 1 / 1 / 1 / 1 | 1 / 1 / 1 / 1 | 一致 |
+| **任务（执行 2）** | 9 | **9** | 一致 —— 但 v2 **默认只会给 7 条**（见下） |
+| **需求（产品 1）** | **3** | **5** | **v1 少给 2 条**：v1 忽略 `browseType`（实测 3=3），那 2 条在 v1 端点上**根本拿不到**；v2 能 |
+| 产品计划详情 | 裸对象 | `{status,productplan,actions}` | v2 单数键是**模块名** `productplan`（不是实体名 `plan`）—— 按实体名解包会取不到 id（真机踩过，已修） |
+| 当前用户 | `GET /user` | **无此端点**（`/v2/user` → 200 空体） | v2 回退 v1 `/user` |
+| 项目详情 | `/projects/{id}` | **注册表里没有 get** | v2 回退 v1 路径 |
+| 分页 | `page`/`limit`（部分端点忽略） | `pageID`/`recPerPage`（**实测会被采纳**：传 3 返回 3，`pageTotal` 跟着变） | v2 更强；但插件当前仍是"本地分页 + 服务端总数"，**尚未改用 v2 的服务端翻页**（列为后续） |
+| 筛选 | 全部被忽略 | `browseType` 等为真服务端参数 | `capabilities.serverFilters: true` |
+
+**最重要的一个发现：v2 的 `browseType` 默认是 `unclosed`。**
+官方注册表里 `task.list` 的 `browseType` 写明 `defaultValue: 'unclosed'` —— 实测同一个执行
+v1 报 9 条、v2 只报 7 条（少掉的正是已关闭的两条），加 `browseType=all` 后 **9 = 9**。
+**悄悄少给数据比报错更糟**，所以 v2 方言**默认显式发送 `browseType=all`**，调用方仍可覆盖。
+
+**版本门禁**：`GET /?mode=getconfig` → `{"version":"ipd5.6",…}`（实测，官方技能文档也建议用它核对站点）。
+注册表里每个动作都带最低 IPD 版本（如 `bug.confirm` 要 `ipd5.5`），门禁在动作级生效：
+服务器版本不足时报"需要禅道 ipd5.5 及以上，而本站点是 ipd5.0"，而不是让它 404。
+
+**为什么 `auto` 仍然先选 v1**（本轮的关键产品判断）：v2 的**读**已经校准且更完整，
+但 v2 的**写**还没逐条校准（`writeSpec` 一律 `verified: false`，默认被门禁挡住）。
+若让 auto 先选 v2，用户会**失去已校准的写能力**（assign/close/log_effort…）——那是能力降级而不是升级。
+所以 v2 目前**显式选用**（`dialect: rest-v2`），等写入校准完再把它提到探测梯前面。
+
+**测试**：新增 `test/dialect-rest-v2.test.js`（16 项：注册表完整性、路径与作用域、`browseType=all` 默认、
+分页参数名、缺参报错、v2 无 get 时回退、写路径映射与"未校准"标记、注册表外动作回退 v1、版本门禁、
+信封取数、模块名解包、业务失败识别、pager 字段）。桩套件 353 → **369**。
+### C.42 第三十八轮：v2 写入逐条校准 + 两个真机缺陷（死锁、假成功）
+
+**一、v2 写入校准矩阵（本机 IPD 5.6，全部经插件 service 走通并读回验证状态）**
+
+| 动作 | v2 结果 | 与 v1 的差异（实测） |
+|---|---|---|
+| task create | ok **verified=true**，状态 wait | **`assignedTo` 要字符串**；v1 要数组（v2 传数组报 `User does not exist.`）|
+| task update | ok verified=true | `PUT /tasks/{id}` 用字符串指派 ✓ |
+| task start | ok verified=true → doing | body `{left, consumed, realStarted}` 与 v1 相同 ✓ |
+| task finish | ok verified=true → done | **v2 还要 `realStarted`**（缺了报「『实际开始』不能为空」）|
+| task close | ok verified=true → closed | `reason` 会被映射成 comment ✓ |
+| task delete | ok（意图式校验） | — |
+| bug resolve / close | ok verified=true → closed | — |
+| **story 写** | create/update/close/delete **回退 v1** 后 ok verified=true | ⚠️ **`POST /api.php/v2/stories` 在 IPD 5.6 上返回的不是 API 响应**（见下）|
+| assign / log_effort | **回退 v1**（`/assignto`、`/estimate`）→ ok verified=true | v2 注册表里根本没有这两个动作；实测 v1 端点仍可用 ✓ |
+| activate（任务） | 实测可用（需 `left`）；Bug 的 activate 需 `openedBuild` | 但**本插件未暴露** active 动作（见"边界"）|
+
+校准手段：`service.write(..., dryRun:false)` + 每步**读回对象状态**确认真的变了；`verified=true` 表示
+写入后的回读校验通过。**未校准的写仍被门禁挡住** —— 实测示例：v2 下 `story close` 在
+`allowUnverifiedWrites:false` 时报"请求形状尚未经真机校准…已默认阻止" ✓（安全默认有效）。
+
+**二、缺陷 A：HTTP 200 的"假成功"（`POST /api.php/v2/stories`）**
+
+实测该路由返回的是**网页端登录页 JSON**：
+`{"status":"success","data":"{\"title\":\"用户登录\",…\"loginExpired\":true,…\"referer\":\"\/zentao\/product-create.json\"}"}`
+—— 它带着 `status:"success"`，如果按常规判断就会报 **ok**（写过没写成功却报成功）。修复：
+`looksLikeWebPagePayload()` 识别这类载荷（`loginExpired` / `keepLogin` / `data` 里是登录页 JSON /
+`referer` 指向 `*.json`），一旦命中就报错。需求写因此**整类回退 v1 已校准端点**（v1 上这些动作是实测校准过的）。
+
+**三、缺陷 B：`dialect: auto` 下的死锁（既有缺陷，本轮才暴露）**
+
+```
+resolveDialect(auto) → probeDialect（探测要带 Token）→ getToken() → exchangeToken()
+                     → resolveDialect() → …（永不返回）
+```
+真机症状：`doctor()` 永不返回，Node 报 `Detected unsettled top-level await`。
+之前一直没被发现，是因为我历次真机脚本都用**显式** dialect；本轮第一次用"真实凭据 + auto"跑。
+修复：**取 Token 不再依赖方言解析** —— 它本来就固定走 v1（v2 没有 tokens 端点，
+而 v1 的 Token 对 v2 请求有效）。新增回归测试（把 `resolveDialect` 加回去立刻变红，变异检查过）。
+
+**四、探测顺序翻转为 v2 优先（有证据才翻）**
+
+上一轮我把 v2 排在后面，理由是"v2 写未校准 → 切过去会**丢失**已校准的写能力"。
+本轮两个条件都满足了，所以翻转：
+1. 任务/Bug 的写在 v2 路径上**逐条校准**（上表）；
+2. v2 没有的动作（assign/log_effort）与实测不可用的（story 写）**整类回退 v1 且沿用 v1 的 verified 判定**
+   —— 实测 story 在 v2 方言下 create→close→delete 全部 ok 且状态真的从 reviewing → closed ✓。
+于是 v2 优先**只增不减**：读更完整（需求 3→5）、v2 的 `pageID`/`recPerPage` 会被采纳、服务端筛选为真。
+
+**五、真机验证（auto 全链路）**
+
+```
+方言：禅道 REST v2（官方新一代 API）（rest-v2）   ← auto 先探 v2 并命中
+任务 = 9 条（与 v1 一致）｜需求 = 5 条（v1 只有 3）
+换取 Token：成功（仅内存缓存、不落盘）
+```
+
+**六、如实记录的边界（没有做，也不假装做了）**
+- v2 注册表里的 `activate` / `change` / `confirm` 在**模型层**还不是可用的写动作（`activate` 与 `confirm`
+  已用原始 HTTP 实测过服务端行为，但本插件的动作表里没有它们）→ 未暴露给工具；
+- v2 独有的写面（如 `PUT /productplans/{id}`、模块创建）本插件尚未暴露（v1 的字段白名单里没有，
+  凭空发属于未校准）；
+- `auto` 会在**老服务器**上先吃一个 v2 的 404（约 1–3 次请求）才落到 v1 —— 探测结果按 baseURL 缓存，代价很小。
+
+测试：桩套件 369 → **372**（新增 v2 写字段差异、假成功守卫、死锁回归各一条，并更新 probe 顺序相关断言）。
+### C.43 第三十九轮：把 activate / confirm 提升为一等动作 + MCP 的运行时验证
+
+**一、`activate` / `confirm` 成为可用的写动作（v2 专属，已真机校准）**
+
+官方 v2 注册表里本来就有 `activate`（task/story/bug）与 `confirm`（bug），但本插件的**模型层**
+从未暴露它们 —— 于是升级到 v2 后这两个能力"看得见、用不上"。本轮补齐：
+
+| 动作 | 支持实体 | v2 必填字段（实测） | 校准结果 |
+|---|---|---|---|
+| `activate` 重开 | task / bug / story | task: **`left`**；bug: **`openedBuild`**；story: **无** | 任务 closed→**doing**、Bug closed→**active**、需求 closed→**draft**，均 ok `verified=true` |
+| `confirm` 确认 Bug | bug | 无（可选 comment） | ok `verified=true`（需服务器 ipd5.5+，本机 5.6 ✓）|
+
+**v1 上如实报不支持**（有实测依据）：`PUT /api.php/v1/tasks/:id/activate` 与 `/stories/:id/activate` 都是
+**404**；`PUT /api.php/v1/bugs/:id/confirm` 返回 **200 但响应体为空**（不可信）。所以 v1 方言对这两个动作
+抛 `UNSUPPORTED`，并在消息里直接告诉用户"改用 auto/rest-v2" ✓。
+
+校准是**走完整链路**做的（模型已接受这两个动作 → v2 方言 → service → 真机 → 读回状态），
+所以覆盖的不只是"路径对不对"，而是端到端可用。
+
+**二、MCP 接入的运行时验证（第 2 项收尾）**
+
+之前在应用里看不到 `mcp__zentao__*` 工具。为区分"配置没生效"与"只是没重启"，做了两件事：
+
+1. **精确核对正在运行的应用**：`request/header` 里最后一次下发的工具清单共 **33 个，没有任何 `mcp__*`**
+   （顺带纠正一个误判：早先"有 MCP 工具 ✅"其实是匹配到我自己回复里的文字）；
+2. **进程时间**：GUI 主进程（占 19387 端口那个）启动于 **22:59:33**，而我写 MCP 条目是 **23:15:52**
+   —— 也就是说**应用在我改配置之后并没有真正重启过**（23:31 那个是子进程）。
+
+然后用**副本 profile + 官方启动器**做了一次真启动（这是自查的关键手段）：
+
+```
+dsh --profile zentao-mcp-probe --dump-config
+  → 组合树里有 `- id: mcp-zentao  name: '@deepseek-ai/dsh-mcp-client'  serverName: zentao` ✓
+
+dsh --profile zentao-mcp-probe --port 0 --no-open
+  → 启动后检查子进程：
+     "D:\Program Files\nodejs\node.exe" "...\zentao-cli\bin\zentao.js" mcp     ← DSH 真的拉起了 MCP 服务 ✓
+```
+
+所以三段都验证过：**配置进组合树 ✓ → 客户端加载并拉起服务 ✓ → 服务本身可用（29 工具、真实数据）✓**。
+唯一剩下的是**重启用户正在跑的那个应用**（我做不了，重启会中断当前会话）—— 重启后工具列表里就会出现
+`mcp__zentao__*`。
+
+**三、本轮测试**：新增 v1 对 v2 专属动作的拒绝、v2 的 activate/confirm 路径与已校准标记、
+必需字段的本地校验；并更新 README 的动作清单与方言说明。桩套件 373 → **375**。
+### C.44 第四十轮：为"完全不用 v1"做的核查 —— 顺带揪出一个**我自己的假成功**
+
+用户问："能不能全部使用 V2 接口、不用 V1"。为了给出有依据的答复，我把三处 v1 依赖逐个查了真机，
+过程中发现一个**我此前说错了的结论**（先说这个）。
+
+**一、`log_effort` 是**假成功**——我上一轮把它标成"已真机校准"是错的**
+
+先前 C.32/C.42 里我把 `log_effort` 记为"已实测确认"，依据是插件报 `ok=true verified=true`。
+这轮用**数据库**做了干净的对照实验（新任务 14）：
+
+```
+v2 PUT /tasks/14 {consumed:1.5,left:2}      → 聚合值真的变成 1.50/2.00   ✓（但不产生工时明细）
+v1 POST /tasks/14/estimate {consumed:2.5,…} → 返回 200，聚合值**没变**，zt_effort **没有新行**  ✗
+经插件再跑一次 log_effort {consumed:9,left:3} → 插件报 ok=true verified=true diff=[]
+                                                而聚合值仍是 1.5/2、明细表仍无该任务的行  ✗✗
+```
+
+根因：`service.js` 的 `VERIFIABLE` 字段表里**没有 `consumed`/`left`**，于是 `log_effort` 的载荷
+"一个字段都没被比对" → `diff=[]` → 被当成验证通过。**"没验证" 被报成了 "验证通过"**，这正是我最不能容忍的
+一类错误，而且它藏在我自己写的校验里。
+
+修复（两处一起）：
+1. `VERIFIABLE` 补上 `consumed` / `left` / `estimate` 的读取；
+2. **`verified` 改为要求"至少真的比对过一个字段"**（`readback !== undefined && checked > 0 && diff.length === 0`），
+   并新增 `checkedFields` 字段如实回报比对了几个字段；`checked === 0` 时给明确的 note
+   （"该动作的字段都不在比对表里，无法确认改动是否生效"）。
+
+真机复验：
+```
+log_effort → ok=true verified=false checked=2 diff=["consumed 期望 9 实际 1.5","left 期望 3 实际 2"]
+update pri → ok=true verified=true  checked=1 diff=[]        ← 真的生效的写入仍然确认
+```
+变异检查：把 `verified` 改回旧语义 → 新增的回归测试立刻变红 ✓。
+
+**顺带修正一条事实**：`zt_effort` 里的工时明细是 **`finish`（currentConsumed）** 产生的
+（现有 6 行分别对应 task 13/3/5/4/1，值都是 4.00 或 2.00），不是 `estimate` 产生的。
+
+**二、"全部用 v2" 的核查结论（逐项有真机证据）**
+
+| 能力 | v2 有等价物吗 | 证据 |
+|---|---|---|
+| 认证 | ✅ **有**：`POST /api.php/v2/users/login {account,password}` → `{status,token,user}` | 实测拿到 32 位 token，且该 token 对 `/v2/products` 等请求有效；官方 SDK 的 `login()` 用的就是这条 |
+| 读（产品/项目/执行/需求/Bug/用户/计划/我的） | ✅ | 前几轮已逐条校准 |
+| 任务 / Bug 的写 | ✅ | 已逐条校准（create/update/start/finish/close/delete/activate、resolve/close/confirm） |
+| 需求**创建** | ✅ 有，但路径是**项目作用域**：`POST /projects/{projectID}/stories`（裸 `POST /stories` 在这台服务器上落到网页端） | 实测该路径返回的是**API 校验错误**（`『评审人』不能为空`），不是网页端 —— 说明路由是真的 |
+| 需求**关闭** | ✅ `PUT /stories/{id}/close` | 实测 ok、状态真的变成 `closed` |
+| 指派 | ✅ 用更新：`PUT /{entity}/{id} {assignedTo}`（v2 注册表里没有 assign 动作） | 实测 Bug 的 `assignedTo` 由 `""` → `"admin"` 且 `assignedDate` 变化 |
+| "当前用户" | ✅ **不需要**：账号来自凭据，官方 SDK 也是这么做的（它没有 me 端点） | SDK 只调 `/users/login` 并把账号存进 profile |
+| **工时明细（log_effort）** | ❌ **没有**：v2 注册表 26 个模块里**没有任何 effort/estimate/worklog 动作**；`PUT {consumed}` 只改聚合值、**不产生工时明细**；而 v1 的 `/estimate` 在这台服务器上**无效**（见上） | 注册表核对 + `zt_effort` 表对照 |
+| `comment`（独立备注） | ❌ v1 路由表里也没有该端点 | 早前已如实标注为未校准 |
+
+**三、因此给用户的可选方案（待其选择后再动手）**
+- **A：v2-only（严格）** —— 认证改走 `/v2/users/login`；需求写改走 v2 路径（项目作用域创建 + `PUT /stories/{id}`）；指派改为 `PUT {assignedTo}`；
+  **去掉 `log_effort`**（因为 v2 无此能力、v1 的又无效），或把它降级为"改聚合值"并在结果里**明确说明不产生工时明细**；
+  再加一个 `avoidV1` 开关：任何仍需 v1 的路径**直接报错**而不是悄悄回退。
+- **B：v2 优先但保留 v1 兜底**（现状）—— 即当前实现：读/写在 v2 上，v2 缺的回退 v1 并标注。
+
+两者我都会把"能力边界"写在工具描述里，不让模型以为做了实际上没做的事。
+### C.45 第四十一轮：严格 v2-only（用户明确要求）
+
+用户选择"严格 v2-only"。目标：**一次会话里一个 REST v1 请求都不发**，而不只是"优先走 v2"。
+
+**一、为做到这一点改了四处**
+
+| 位置 | 原来 | 现在 |
+|---|---|---|
+| 认证 | 固定走 v1 的 `POST /tokens` | `dialect: rest-v2` 或 `avoidV1: true` 时走 **v2 的 `POST /users/login`**（官方 SDK 的 login 就是这条，实测返回 `{status,token,user}` 且 token 对后续 v2 请求有效） |
+| "我是谁" | v2 没有该端点 → 回退 v1 `/user` | **不需要**：账号来自凭据（service 新增 `getAccount` 依赖）；`meSpec()` 返回 undefined，探测把它记为 `not-supported` 并跳过 |
+| 指派 assign | v2 注册表无此动作 → 回退 v1 `/assignto` | **v2 更新字段**：`PUT /{plural}/{id} {assignedTo[, left]}`（实测 Bug 的 assignedTo "" → "admin" 且 assignedDate 变化） |
+| 工时 log_effort | v2 无端点 → 回退 v1 `/estimate` | **v2 更新字段**：`PUT /{plural}/{id} {consumed[, left]}` —— ⚠️ 只改聚合值、**不产生工时明细**（在 note 里如实写明） |
+| 需求创建 | 整类回退 v1 | **v2 项目作用域**：`POST /projects/{projectID}/stories`（裸 `POST /stories` 实测返回网页端登录页 JSON，不是 API） |
+
+新增配置 `avoidV1`（默认 false）：打开后**任何需要回退 v1 的路径直接报错**（`service.call` 里拦住
+带 `basePath: /api.php/v1` 的 spec），而不是悄悄回退。`comment` 在 v1/v2 都没有端点，严格模式下报
+`UNSUPPORTED` 并提示改用 `start/finish/close/resolve` 的 comment 字段。
+
+**二、真机验证（`dialect: rest-v2` + `avoidV1: true`，记录每一次请求的 URL）**
+
+```
+总请求 29｜v2 28｜**v1 0**   ✅ 严格 v2-only 成立
+前几条: GET /?mode=getconfig（版本探测）→ POST /api.php/v2/users/login
+        → POST /api.php/v2/tasks → GET /api.php/v2/tasks/17 …
+
+create task                verified=true checked=2 id=17
+assign {assignedTo,left}   verified=true checked=2       ← v2 更新字段
+log_effort {consumed,left} verified=true checked=2       ← v2 更新字段
+start                      FAIL「此任务已被启动，不能重复启动！」（见下"顺序"）
+finish                     verified=true checked=1       ← 按**结果状态**校验
+close {reason}             verified=true checked=1
+delete                     verified=true「已删除（回读为 404）」
+create story（项目作用域）   verified=true checked=2 id=9
+close story                verified=true checked=1
+delete story               verified=true
+project 详情               UNSUPPORTED「strict v2-only：v2 注册表没有 project.get」← 边界，如实报错
+```
+
+**三、这一轮又修掉两个**校验**缺陷（都是"验证得不够/判错"，而不是"没验证"）**
+
+1. **状态流转动作本来"无法确认"**：finish/close/resolve 的载荷字段都不在可比对表里 → `checked=0`
+   →（上一轮修好之后）如实报"无法确认"。但它们的可校验点其实是**结果状态** —— 于是新增
+   `TRANSITION_STATUS`（**只登记有实测证据的组合**：task start→doing / finish→done / close→closed、
+   bug resolve→resolved / close→closed / activate→active、story close→closed / activate→draft），
+   载荷没有可比对项时改按结果状态比对，现在 finish/close 都能报 `verified=true checked=1`。
+2. **删除后的回读被判成 VALIDATION**：v2 对"对象不存在"也是 **HTTP 200 + `{status:'fail',message:'Task does not exist.'}`**，
+   一律当 VALIDATION 会让删除校验（它靠 `NOT_FOUND` 判定成功）报"回读校验失败"。现在按消息内容区分：
+   含 `does not exist / not found / 不存在` → `NOT_FOUND` → 删除如实报"已删除（回读为 404）"。
+
+**四、一条真实 API 语义（已写进工具说明与 README）**
+
+v2 下指派/工时是"更新字段"，实测**未启动的任务写入 consumed 后会被视为已启动**，之后再调 `start`
+会被拒（"此任务已被启动，不能重复启动！"）。所以顺序应当是 **先 `start`，再 `log_effort`**。
+
+**五、边界（严格模式下会报错，不会悄悄降级）**
+- v2 没有 `project` 的 get → 项目详情在严格模式下不可用；
+- v2 没有工时明细端点 → `log_effort` 只改聚合值（note 里明说）；
+- `comment` 在 v1/v2 都没有端点 → 严格模式报错并给出替代做法。
+
+测试：桩套件 377 → **379**（v2 方言测试重写为严格语义：认证走 `/users/login`、me 不需要端点、
+assign/log_effort 走更新字段、需求创建要求 project 作用域、`avoidV1` 下报错；探测测试同步 me 步骤被跳过）。
+
+### C.46 第四十二轮：把严格 v2-only 的"该处理的"全部处理掉
+
+**一、把"能救回来的能力"救回来（都是实测后才写进代码的）**
+
+| 能力 | 结论 | 证据 |
+|---|---|---|
+| **项目详情** | ✅ **v2 有**，只是注册表没列：`GET /api.php/v2/projects/1` → `200 {status,project:{name,status,…}}` | 登记为 `DETAIL_PATH_OVERRIDES` 里的**特例**（逐个登记，不猜路径），严格模式下项目详情照旧可用 |
+| **需求更新** | ✅ `PUT /api.php/v2/stories/{id}`（pri 2 → 1 真变了） | 已标 `verified` |
+| **Bug 创建** | ✅ `POST /api.php/v2/bugs`，但**要求正文里的 `productID`**（v1 用 `product` 且它在 v1 是路径参数） | 实测缺它报 `Missing required parameter: productID.`；补上后 `200 {message,id}` |
+| **Bug 更新 / 删除** | ✅ `PUT /api.php/v2/bugs/{id}`（pri 3 → 1）、`DELETE` 均生效 | 已标 `verified` |
+| **release / build 详情** | ❌ v2 注册表没有 get、也无实测路径 | 严格模式下**如实报错**（这正是"边界"该有的样子） |
+
+**二、新增测试当场又抓到一个真 bug**
+
+给"状态流转校验"补**负向测试**（状态没变时必须报 `verified=false` 并给出状态差异）时，跑出
+`INTERNAL: Assignment to constant variable` —— 原因是我把
+`const { diff, checked } = verifyAgainst(...)` 解构出来的 `diff` 在"状态不符"分支里又赋值了一次。
+**正向用例永远不会触发这条路径**（状态一致时不进入该分支），所以只有负向用例能抓到。
+改成 `let diff = verification.diff` 后，负向测试通过，真机复核 finish/close 仍报 `verified=true checked=1`。
+
+**三、本轮新增的离线回归（此前只有真机证据、没有离线守护）**
+- 状态流转校验：状态**变了** → `verified=true checked=1`；状态**没变** → `verified=false` + `status 期望 done 实际 doing`；
+- 删除校验：v2 的"对象不存在"（HTTP 200 + `status=fail`）必须识别成 `NOT_FOUND` → 报"已删除"（夹具特意做成**有状态**：预读成功、删除后回读失败）；
+- v2 登录：`dialect: rest-v2` 时 `exchangeToken` 必须打 `/api.php/v2/users/login`，不得再碰 v1 的 `/tokens`；
+- Bug 创建的 `productID` 补全（含从 `payload.product` / `scope.product` 取值）。
+
+测试：桩套件 379 → **385**。
+
+**四、用户 profile 已按"严格 v2-only"配置并重新启用插件**
+`cordis.patch.yml`：`dialect: rest-v2` + `avoidV1: true`；`package.json` 的 `dsh.profile.bundles` 重新加入
+`@local/dsh-plugin-zentao`（与插件页勾选等价，重启生效；取消勾选即可立刻回退）。
+
+### C.47 第四十三轮：把"还有哪些问题"逐项清掉
+
+**一、又救回四个实体的详情（严格 v2-only 下不再是边界）**
+
+同批探测发现：注册表里没列 get 的模块，路由其实存在 —— 判据是返回 **API 级**响应而不是 404/网页：
+
+- GET /api.php/v2/builds/1 → 200 {"status":"fail","message":"Build does not exist."} → 路由存在，登记特例
+- GET /api.php/v2/releases/1 → 200 "抱歉，您访问的对象不存在！" → 同上
+- GET /api.php/v2/testtasks/1 → 200 "Testtask does not exist." → 同上
+- GET /api.php/v2/testcases/1 → 200 "Case does not exist." → 同上
+- GET /api.php/v2/todos/1 → **404 Not found** → 真的没有，留作边界
+
+于是 DETAIL_PATH_OVERRIDES 扩到 project/build/release/testtask/testcase，并新增测试断言：
+**13 个受支持实体的详情在 v2 下无一回退 v1**。
+
+**二、avoidV1 的一个真漏洞（已修）**：dialect=auto + avoidV1=true 时，探测仍可能解析出 v1，
+而 v1 方言根本不知道 avoidV1，请求就真的打到 /api.php/v1 了（开关形同虚设）。
+修法：resolveDialect 在 avoidV1 时把候选收窄成 [rest-v2]（probeDialect 新增 order 参数）；
+服务器没有 v2 时以 UNSUPPORTED 明确失败。新增测试锁定：v2 探测失败不得退到 v1，且一次 v1 探测请求都不发。
+
+**三、v2 的 assign / log_effort 之前被标"未校准"（已修）**：它们其实已经真机校准（回读真的比对了
+assignedTo / consumed / left 并报 verified=true）。标成未校准意味着"默认配置下用不了"，属于过度保守。
+
+**四、插件自带的技能正文在教 v1（已重写）**：src/skill.js 标题曾是"企业版 REST v1"，还写着
+"v1 没有我的待办聚合端点"、把 log_effort 当成能写工时明细 —— **这是模型每轮都读到的内容**，
+会把模型带回 v1 思路。重写要点：v2 有聚合端点；v2 无工时端点（要明细用 finish 的 currentConsumed）；
+先 start 再 log_effort；Bug 创建要 productID；需求创建要 payload.project；activate/confirm 只有 v2 有；
+comment 两边都没有；状态流转按结果状态回读校验。
+
+**五、其它清理**：补丁里"rest-v2 是未实现占位"的过时注释删掉；工具说明补上 v2 需求创建要 project 与
+工时的真实语义；C.32 加作废指针（那里把 log_effort 记成已校准是错的）。
+
+测试：385 项离线 + 17 项真实契约全绿。

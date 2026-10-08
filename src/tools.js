@@ -223,7 +223,7 @@ export function registerTools (ctx, service, getConfig) {
       '各 action 的 payload 字段（都是禅道原始字段名）：\n' +
       '· create：task 用 name/type/assignedTo(数组)/pri/estimate/**estStarted（实测必填）**/deadline（须给 execution）；' +
       'bug 用 title/severity/pri/type/steps/openedBuild（须给 product）；' +
-      'story 用 title/product/pri/category/**spec（描述，实测必填）**/verify（产品开启评审时还要 reviewer，且 **reviewer 必须传数组**）。\n' +
+      'story 用 title/product/pri/category/**spec（描述，实测必填）**/verify（产品开启评审时还要 reviewer，且 **reviewer 必须传数组**）；**v2 方言下还必须给 payload.project（项目 ID）** —— v2 的真路径是 POST /projects/{projectID}/stories，裸 POST /stories 不是 API 路由。\n' +
       '· update：task 可改 module/story/fromBug/name/type/assignedTo/pri/estimate/estStarted/deadline；' +
       'bug 可改 title/keywords/severity/pri/type/os/browser/steps/deadline/module/execution；' +
       'story 只可改 title/spec/verify。**注意 task 与 bug 都没有 status 字段** —— 改状态请用 start/finish（任务）或 resolve/close（Bug）。\n' +
@@ -234,7 +234,11 @@ export function registerTools (ctx, service, getConfig) {
       '· resolve（仅 bug）：resolution 必填（fixed/notrepro/duplicateBug/bydesign/willnotfix/postponed/external），可选 resolvedBuild/comment/assignedTo。\n' +
       '· close：**必须给顶层 reason**（它会被作为备注写入禅道，避免无声变更）；**关闭需求时还要 payload.closedReason**（如 done/willnotdo/duplicate/postpone）；可选 comment。\n' +
       '· delete：无 payload。\n' +
-      '· log_effort：consumed 必填（本次消耗工时），可选 date/work/left（Bug 用 dates 而不是 date，且没有 left）。',
+      '· log_effort：consumed 必填（本次消耗工时），可选 date/work/left（Bug 用 dates 而不是 date，且没有 left）。⚠️ **v2 下没有任何工时端点**：该动作在 v2 是「更新字段」，**只改 consumed/left 聚合值、不产生工时明细**；要留下工时明细请用 **finish 的 currentConsumed**（实测会写入工时明细表）。另外 v2 下请**先 start 再 log_effort**：未启动的任务一旦被写入 consumed 就会被视为已启动，之后 start 会被拒。\n' +
+      '· activate（重开，**只有 v2 方言有**）：任务**必须给 payload.left**（剩余工时）；Bug **必须给 payload.openedBuild**（影响版本）；' +
+      '需求无需额外字段；可选 comment。实测 v1 没有该端点（404），所以 v1 方言下会明确报不支持 —— 用 auto/rest-v2 即可。\n' +
+      '· confirm（仅 bug，**只有 v2 方言有**，需服务器 ipd5.5+）：可选 comment。实测 v1 的同名端点返回 200 但**响应体为空**，不可信，故未在 v1 开放。\n' +
+      '· **v2 下的顺序**：指派与工时在 v2 是用「更新字段」实现的（v2 没有 assign/effort 端点）。实测**未启动的任务一旦被写入 consumed，就会被视为已启动**，之后再调 start 会被拒（"此任务已被启动"）。所以要改状态请**先 start、再 log_effort**。',
     parameters: {
       action: { type: 'string', required: true, enum: [...WRITE_ACTION_KEYS], description: '要执行的写操作' },
       entity: {

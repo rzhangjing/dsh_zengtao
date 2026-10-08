@@ -45,9 +45,20 @@ const PROBE_STEPS = [
   { key: 'me', label: '当前用户' },
 ]
 
-/** 按探测步骤构造请求规格。 */
+/**
+ * 按探测步骤构造请求规格。
+ *
+ * `meSpec()` 可能返回 undefined（v2 没有"当前用户"端点，且账号本来就在凭据里）——
+ * 这时**跳过**这一步，而不是拿 undefined 去发请求（那会直接抛，把整个探测带崩）。
+ */
 function specForStep (dialect, step) {
-  return step.key === 'me' ? dialect.meSpec() : dialect.listSpec(step.key, { page: 1, limit: 1 })
+  if (step.key === 'me') return dialect.meSpec()
+  return dialect.listSpec(step.key, { page: 1, limit: 1 })
+}
+
+/** 该方言是否支持这个探测步骤。 */
+function supportsStep (dialect, step) {
+  return specForStep(dialect, step) !== undefined
 }
 
 /** 判定一个探测响应是否"命中"。 */
@@ -65,8 +76,12 @@ function isHit (step, response) {
  * @param {'auto'|'rest-v1'|'rest-v2'|'legacy-api'} [params.configured]
  * @returns {Promise<{dialectId:string, dialectLabel:string, probedAt:string, version?:string, facts:object[], probeVersion:number}>}
  */
-export async function probeDialect ({ transport, base, token, configured = 'auto' }) {
-  const order = configured && configured !== 'auto' ? [configured] : [...PROBE_ORDER]
+export async function probeDialect ({ transport, base, token, configured = 'auto', order: orderOverride }) {
+  // `order` 覆盖用于**严格 v2-only**：把候选收窄成只剩 v2，避免 `auto` 落到 v1
+  // （否则 avoidV1 形同虚设 —— 解析成 v1 方言之后请求就真的打到 /api.php/v1 了）。
+  const order = Array.isArray(orderOverride) && orderOverride.length > 0
+    ? [...orderOverride]
+    : (configured && configured !== 'auto' ? [configured] : [...PROBE_ORDER])
   const facts = []
   let sawAuthSignal = false
   let sawForbiddenOnly = false
@@ -94,6 +109,11 @@ export async function probeDialect ({ transport, base, token, configured = 'auto
     let stopped = false
 
     for (const step of PROBE_STEPS) {
+      // 该方言没有这个步骤（例如 v2 没有 me 端点）→ 跳过并如实记一笔，不要拿 undefined 去请求
+      if (!supportsStep(dialect, step)) {
+        facts.push({ dialect: id, step: step.key, outcome: 'not-supported' })
+        continue
+      }
       let spec
       try {
         spec = specForStep(dialect, step)
@@ -197,6 +217,32 @@ export async function probeDialect ({ transport, base, token, configured = 'auto
         '或在设置页把 dialect 手工指定为 rest-v1 后重试。',
     },
   )
+}
+
+/**
+ * 取**权威**服务器版本：`GET <base>/?mode=getconfig`。
+ *
+ * 实测响应：`{"version":"ipd5.6","requestType":"PATH_INFO","requestFix":"-","systemMode":"PLM",…}`
+ * （官方 Agent 技能文档也把 `?mode=getconfig` 列为核对站点配置的手段 —— 见 E2011/E2012 的处理建议）。
+ *
+ * 为什么需要它：官方 v2 注册表里**每个动作**都带最低版本（如 `ipd5.5`），
+ * 拿不到版本就没法给出可读的门禁错误，只能让它 404。取不到时如实返回 undefined。
+ */
+export async function fetchServerVersion ({ transport, base, signal }) {
+  try {
+    const response = await transport.request({
+      base,
+      method: 'GET',
+      path: '/',
+      query: { mode: 'getconfig' },
+      signal,
+    })
+    const version = response?.json?.version
+    if (typeof version === 'string' && version.trim() !== '') return version.trim()
+    return undefined
+  } catch {
+    return undefined
+  }
 }
 
 /**

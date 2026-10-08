@@ -228,14 +228,30 @@ export function pickArray (json, preferredKey) {
 }
 
 /**
- * 容错地取出分页元数据。响应里的分页字段是已核验的（page/total/limit）。
+ * 容错地取出分页元数据。
+ *
+ * 已核验的两种形态：
+ *   · **v1**：信封顶层 `page` / `total` / `limit`（如 `{page,total,limit,products}`）；
+ *   · **v2**：分页在 `pager` 里，字段名不同 —— 实测
+ *     `{"offset":0,"recTotal":7,"recPerPage":3,"pageCookie":null,"pageTotal":3,"pageID":1,…}`。
+ *
+ * v2 的 `recPerPage` **真的会被服务端采纳**（实测传 3 就返回 3 条，`pageTotal` 也跟着变），
+ * 而 v1 的 `limit` 只在部分端点生效 —— 所以这里两种键名都要认，否则 v2 下 `serverTotal` 会丢。
  */
 export function pickPageMeta (json, fallback = {}) {
   if (json === null || typeof json !== 'object') return { ...fallback }
+  const pager = json.pager !== null && typeof json.pager === 'object' ? json.pager : {}
+  const read = (...values) => {
+    for (const value of values) {
+      const parsed = toNumber(value)
+      if (parsed !== undefined) return parsed
+    }
+    return undefined
+  }
   return {
-    page: toNumber(json.page) ?? fallback.page,
-    total: toNumber(json.total) ?? fallback.total,
-    limit: toNumber(json.limit) ?? fallback.limit,
+    page: read(json.page, pager.pageID, pager.page) ?? fallback.page,
+    total: read(json.total, pager.recTotal, pager.total) ?? fallback.total,
+    limit: read(json.limit, pager.recPerPage, pager.limit) ?? fallback.limit,
   }
 }
 

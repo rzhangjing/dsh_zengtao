@@ -46,6 +46,11 @@ export const Config = z.object({
       '默认关闭：官方手册没有给出这些动作的 REST 形状，盲目发送可能打到别的端点。' +
       '注意本机实测后**只剩 comment 一个动作**仍未校准（它在禅道 IPD 5.6 上根本没有对应路由），' +
       '其余写动作都已带真机证据。用 /zentao doctor 看未校准清单、用 dryRun 核实后再决定是否打开'),
+  avoidV1: z.boolean().default(false).volatile()
+    .description('**严格 v2-only**：打开后插件**绝不发任何 REST v1 请求** —— 认证改走 v2 的 ' +
+      '`POST /api.php/v2/users/login`；指派与工时改用 v2 的更新字段；注册表里确实没有的能力' +
+      '（如"当前用户"、项目详情）会**直接报错**而不是悄悄回退 v1。' +
+      '注意：v2 没有工时明细端点，此时 log_effort 只改 consumed/left 聚合值、**不会产生工时明细**'),
 
   // ── 传输 ──────────────────────────────────────────────
   requestTimeoutMs: z.number().step(1000).min(1000).max(300000).default(20000).volatile()
@@ -92,6 +97,7 @@ export function snapshotConfig (config) {
     allowBulkWrite: value(config.allowBulkWrite, false),
     maxBulkItems: value(config.maxBulkItems, 20),
     allowUnverifiedWrites: value(config.allowUnverifiedWrites, false),
+    avoidV1: value(config.avoidV1, false),
     requestTimeoutMs: value(config.requestTimeoutMs, 20000),
     maxRetries: value(config.maxRetries, 2),
     maxPageSize: value(config.maxPageSize, 50),

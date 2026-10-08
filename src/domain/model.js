@@ -173,11 +173,38 @@ export const WRITE_ACTIONS = Object.freeze({
   comment: { label: '添加备注', entities: ['story', 'task', 'bug'], requiresId: true },
   resolve: { label: '解决 Bug', entities: ['bug'], requiresId: true },
   close: { label: '关闭', entities: ['story', 'task', 'bug'], requiresId: true, reasonRequired: true },
+  // ⚠️ 下面两个动作**只有 v2 有**（真机实测：v1 的 `PUT /tasks/:id/activate` 与 `/stories/:id/activate`
+  // 都是 404；v1 的 `PUT /bugs/:id/confirm` 返回 200 空体，不可信）。v1 方言会明确报"暂不支持"，
+  // 而 v2 注册表里三个实体都有 activate ✓、Bug 有 confirm（需 ipd5.5+，本机 5.6 ✓）。
+  activate: { label: '重新激活（重开）', entities: ['story', 'task', 'bug'], requiresId: true },
+  confirm: { label: '确认 Bug', entities: ['bug'], requiresId: true },
   delete: { label: '删除', entities: ['story', 'task', 'bug'], requiresId: true, destructive: true },
   log_effort: { label: '登记工时', entities: ['task', 'bug', 'story'], requiresId: true },
 })
 
 export const WRITE_ACTION_KEYS = Object.freeze(Object.keys(WRITE_ACTIONS))
+
+/**
+ * 状态流转动作的**期望结果状态**（每一项都在本机真机实测过）。
+ *
+ * 为什么需要：finish/close/resolve 这些动作的**载荷字段**（currentConsumed / comment…）
+ * 都不在写后比对的字段表里，于是"一个字段都没比对"→ 只能报"无法确认"。
+ * 但这些动作真正的可校验点是**结果状态**：读回来是不是 `done`/`closed` 是可以确认的。
+ *
+ * ⚠️ 只登记有实测证据的组合；没有证据的（如 bug 的 confirm 之后到底是 closed 还是别的）
+ * 刻意不写 —— 宁可少校验一项，也不要拿猜测当校验。
+ */
+export const TRANSITION_STATUS = Object.freeze({
+  'task:start': 'doing',
+  'task:finish': 'done',
+  'task:close': 'closed',
+  'task:activate': 'doing',
+  'bug:resolve': 'resolved',
+  'bug:close': 'closed',
+  'bug:activate': 'active',
+  'story:close': 'closed',
+  'story:activate': 'draft',
+})
 
 export function writeActionOf (key) {
   const spec = WRITE_ACTIONS[key]
@@ -243,6 +270,11 @@ export const BUG_UPDATE_FIELDS = BUG_CREATE_FIELDS
 export const STORY_CREATE_FIELDS = Object.freeze([
   'title', 'product', 'pri', 'category', 'reviewer', 'spec', 'verify', 'source', 'sourceNote',
   'estimate', 'keywords',
+  // ⚠️ `project` 不是 v1 的创建字段，而是 **v2 的路径作用域**：实测 v2 的真路径是
+  // `POST /projects/{projectID}/stories`（裸 `POST /stories` 在这台服务器上返回网页端响应）。
+  // 放在这里是为了让 service 的字段白名单放行；**v1 的构造器会把它从正文里排除**
+  // （见 rest-v1.js 的 STORY_CREATE_EXCLUDE），所以 v1 请求体不会多出这个字段。
+  'project',
 ])
 
 /** [文档] POST /stories/:id/change —— 只有这三个字段 */

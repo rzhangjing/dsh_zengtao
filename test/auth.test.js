@@ -382,6 +382,28 @@ test('exchangeToken：缺少账号或密码时前置拒绝', async () => {
   assert.equal(fake.calls.length, 0, '不该发出任何请求')
 })
 
+test('exchangeToken **不得依赖方言解析**（否则 dialect=auto 下会死锁）', async () => {
+  // 真机症状：`dialect: auto` 时 doctor 永不返回（Node 报 unsettled top-level await）。
+  // 死锁链条：resolveDialect(auto) → probeDialect（探测要带 Token）→ getToken →
+  //          exchangeToken → resolveDialect → …
+  // 所以换取 Token 必须**独立于方言**（它本来就走 v1：v2 没有 tokens 端点）。
+  const fake = createFakeTransport({ 'POST /tokens': () => ({ json: { token: 'tok-1' } }) })
+  const service = createService({
+    transport: fake.transport,
+    store: createMemoryStore(),
+    locks: new KeyedQueue(),
+    getConfig: () => fakeConfig({ dialect: 'auto', cacheTtlSeconds: 0 }),
+    getToken: async () => { throw new Error('换取 Token 的过程中不该去取 Token（那是死锁）') },
+    logger: () => {},
+  })
+
+  const result = await service.exchangeToken({ account: 'admin', password: 'pw' })
+  assert.deepEqual(result, { token: 'tok-1' })
+  assert.equal(fake.calls.length, 1, '只该有一次请求')
+  assert.equal(fake.calls[0].pathname, '/api.php/v1/tokens', '取 Token 永远走 v1')
+  assert.equal(fake.calls.filter((call) => call.pathname.includes('/products')).length, 0, '不该发生任何方言探测')
+})
+
 /* ─────────────── 401 会丢掉缓存（端到端：service + tokenSource）─────────────── */
 
 test('端到端：收到 401 后 tokenSource 失效，下一次调用会重新换取', async () => {
@@ -421,4 +443,20 @@ test('端到端：收到 401 后 tokenSource 失效，下一次调用会重新�
   const second = await service.query({ entity: 'product', page: 1, limit: 5 })
   assert.equal(second.serverTotal, 0)
   assert.equal(exchanges, 2, '401 之后必须重新换取一次 Token')
+})
+
+
+test('exchangeToken：dialect=rest-v2 时走 **v2 的 /users/login**（严格 v2-only 的前提）', async () => {
+  const fake = createFakeTransport({ 'POST /users/login': () => ({ json: { status: 'success', token: 'v2-token' } }) }, { stripPrefix: '/api.php/v2' })
+  const service = createService({
+    transport: fake.transport,
+    store: createMemoryStore(),
+    locks: new KeyedQueue(),
+    getConfig: () => fakeConfig({ dialect: 'rest-v2', cacheTtlSeconds: 0 }),
+    getToken: async () => { throw new Error('不该在这里去取 Token') },
+    logger: () => {},
+  })
+  const result = await service.exchangeToken({ account: 'admin', password: 'pw' })
+  assert.deepEqual(result, { token: 'v2-token' })
+  assert.equal(fake.calls[0].pathname, '/api.php/v2/users/login', 'v2 方言下不得再打 v1 的 /tokens')
 })

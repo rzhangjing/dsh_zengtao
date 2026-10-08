@@ -225,7 +225,11 @@ const WRITE_BUILDERS = {
       return { method: 'POST', path: `/products/${product}/bugs`, body, dropped }
     }
     if (entity === 'story') {
-      const { body, dropped } = pickFields(payload, STORY_CREATE_FIELDS)
+      // `project` 只对 **v2** 有意义（它是 v2 的路径作用域 `POST /projects/{id}/stories`），
+      // v1 的创建端点没有这个字段 —— 从正文里剔除，只作为"已消费"记在 dropped 里。
+      const { project: _project, ...rest } = payload ?? {}
+      const { body, dropped } = pickFields(rest, STORY_CREATE_FIELDS.filter((key) => key !== 'project'))
+      if (payload?.project !== undefined) dropped.push('project（v1 创建需求没有该字段，仅 v2 用作路径作用域）')
       // 实测：需求创建时『描述』(spec) 必填（缺它服务端报「『描述』不能为空。」）；
       // 另外产品开启评审时 reviewer 必填，且 **reviewer 要传数组**（传字符串/数字会被判成空）。
       if (body.spec === undefined || String(body.spec).trim() === '') {
@@ -472,6 +476,15 @@ export function createRestV1Dialect ({ base } = {}) {
     },
 
     writeSpec (action, { entity, id, payload = {}, scope = {} } = {}) {
+      // v2 专属动作：v1 上实测不存在（`PUT /tasks/:id/activate`、`/stories/:id/activate` 都是 404；
+      // `PUT /bugs/:id/confirm` 返回 200 但**响应体为空**，不可信）。明确报出来 + 给出可行做法。
+      if (action === 'activate' || action === 'confirm') {
+        throw new ZenTaoError(
+          CODES.UNSUPPORTED,
+          `REST v1 没有「${action === 'activate' ? '重新激活' : '确认 Bug'}」这个端点（实测 ${action === 'activate' ? '404' : '200 空体，不可信'}）。` +
+          '请在设置页把 dialect 设为 auto 或 rest-v2（服务器需支持 v2）。',
+        )
+      }
       const build = WRITE_BUILDERS[action]
       if (!build) throw new ZenTaoError(CODES.UNSUPPORTED, `暂不支持该写操作："${action}"。`)
       const built = build({ entity, id, payload, scope })

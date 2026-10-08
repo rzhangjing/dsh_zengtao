@@ -16,7 +16,7 @@ DeepSeek Harness 的**禅道（ZenTao）企业版**插件。让 Agent 能查询�
 |---|---|
 | Host 半 + Client 半实现 | ✅ 完成（5 个工具 / 1 个命令 + 7 子命令 / 1 个技能 / 提示词段 2 变量 / 会话投影 / 设置卡片 / 会话卡片 / 全屏看板 + 侧栏入口） |
 | 全部源文件语法 | ✅ 48 个 JS/MJS 文件 `node --check` 通过 |
-| 离线单元测试 | ✅ **353 项全绿**（`npm test`，不需要禅道） |
+| 离线单元测试 | ✅ **385 项全绿**（`npm test`，不需要禅道） |
 | 真实包契约测试 | ✅ **17 项全绿**（真实 schemastery/defineTool/defineDomain/zod、真实补丁与 profile 装载器、**真实 Cordis 框架**） |
 | §7.6 六项待实测校准 | ✅ 全部有定论（4 项确证 / 1 项确证"参数不存在" / 1 项配置级取证），其中端点路径、网页深链、请求参数三项是**运行级实证** |
 | §14.2 M1 / M2 / M4 / M6 | ✅ 达成（含**真机**幂等、并发冲突、写入回读、软删除证据） |
@@ -53,7 +53,8 @@ DeepSeek Harness 的**禅道（ZenTao）企业版**插件。让 Agent 能查询�
 | 写入策略 `writePolicy` | `readonly` 拒绝一切写入 / `confirm` 每次写入都要确认（默认）/ `trusted` 仅删除类与批量需要确认 |
 | 允许未校准写 `allowUnverifiedWrites` | **默认关闭**。未打开时，那些"官方手册没给出 REST 形状"的写动作（目前只剩 `comment`）只能 `dryRun`，真实执行会被阻止。核实过真实行为后再打开 |
 | 附带原始载荷 `includeRawPayload` | 校准字段名时打开：查询结果里给首条、详情里给该条，附带**已脱敏**的原始 JSON（秘密字段会被替换成 `***`） |
-| 接口方言 `dialect` | 保持 `auto`（自动探测）；企业版 6.0+ 会探到 `rest-v1` |
+| 接口方言 `dialect` | `auto`（默认：**先探 v2**，老服务器自动落到 v1）／`rest-v1`／`rest-v2`（官方新一代 API）／`legacy-api`（未实现，仅诊断）。v2 的**读**已逐条真机校准且更完整（同一执行 v1 需求只给 3 条、v2 给 5 条）；v2 的**写**：任务与 Bug 走 v2 已校准路径，assign/log_effort 与需求写按实测回退 v1 已校准端点 —— **能力不降级** |
+| 严格 v2-only `avoidV1` | 打开后**绝不发任何 REST v1 请求**：认证走 `POST /api.php/v2/users/login`、指派与工时改用 v2 的更新字段、`my` 用凭据里的账号；注册表里确实没有的能力（如 `release` 详情、v1 的 `comment`）会**直接报错**而不是悄悄回退（`project` 详情**已救回**：`GET /api.php/v2/projects/{id}` 实测可用，虽未列在注册表里）。实测一次完整会话：29 次请求、**v1 次数 = 0**。注意 v2 没有工时明细端点 → `log_effort` 只改 consumed/left 聚合值、**不产生工时明细** |
 | **账号 / 密码** | 填你的禅道登录账号与密码。**两者都存进 DSH 凭据库**，不写进配置文件；插件用它们自动换取 API Token |
 
 **认证怎么工作的**（实测约束：禅道 REST v1 **只认 `Token` 请求头**，不能每次请求都带账号密码）：
@@ -105,6 +106,23 @@ DeepSeek Harness 的**禅道（ZenTao）企业版**插件。让 Agent 能查询�
 /zentao help           帮助
 ```
 
+### 官方 CLI 与官方 MCP 服务（可选，与本插件并存）
+
+禅道官方有独立的命令行工具 `zentao-cli`（npm，MIT，作者是禅道官方），并且自带 **MCP 服务**：
+
+```bash
+npm install -g zentao-cli          # 或 npx zentao-cli
+zentao login -s http://127.0.0.1/zentao -u 你的账号   # 交互登录（推荐，凭据存在 CLI 自己的配置里）
+zentao product --pick=id,name       # 直接查
+zentao mcp                          # 起 MCP 服务（stdio），供 AI Agent 调用
+```
+
+它和本插件**不冲突**：官方 CLI 走 **API 2.0**、提供 29 个动作式工具（`zentao_<模块>` + `action` 参数）；
+本插件走 DSH 原生集成（工具 + `/zentao` 命令 + 看板 + 写入门禁）。要用官方 MCP 时，
+在 profile 补丁里加一条 `@deepseek-ai/dsh-mcp-client` 配置（见 `design/02-detailed-design.md` 附录 C.39），
+工具会以 `mcp__zentao__*` 出现。凭据二选一：先跑一次 `zentao login`，或在启动 DSH 前导出
+`ZENTAO_ACCOUNT` / `ZENTAO_PASSWORD`（**不要把密码写进配置文件**）。
+
 ### 校准流程（拿到真实禅道后的第一步）
 
 `/zentao sweep` 是**只读**的（只发 GET），可以放心对着生产库跑：
@@ -134,7 +152,11 @@ zentao_write(action="update", entity="task", id="18", payload={patch:{pri:1}}, d
 
 第 ②、③ 步之间还有一道保护：写入前会先读当前对象；**如果读不到可识别的对象，就中止写入**（绝不会在"不知道当前状态"的情况下改数据）。
 
-可用动作：`create` `update` `start` `finish` `assign` `comment` `resolve` `close` `delete` `log_effort`。
+可用动作：`create` `update` `start` `finish` `assign` `comment` `resolve` `close` `activate` `confirm` `delete` `log_effort`。
+
+其中 **`activate`（重开）与 `confirm`（确认 Bug）只有 `rest-v2` 方言支持**：实测 v1 没有 activate 端点
+（`PUT /api.php/v1/tasks/:id/activate` 是 404），v1 的 `confirm` 返回 200 但**响应体为空**、不可信。
+`activate` 的必填字段（都已真机校准）：任务 `payload.left`、Bug `payload.openedBuild`、需求无需额外字段。
 
 **两处最容易搞错、插件会主动拦下的地方**：
 
@@ -145,7 +167,7 @@ zentao_write(action="update", entity="task", id="18", payload={patch:{pri:1}}, d
 
 ## 安全模型
 
-- **凭据**：只有 Token 进凭据库；配置文件里只有引用名。工具结果、错误消息、日志、诊断输出里的 token/cookie/密码都会被脱敏。
+- **凭据**：**账号与密码**进 DSH 凭据库（配置文件里只有引用名）；换取到的 API Token **只在内存缓存、不落盘**。工具结果、错误消息、日志、诊断输出里的 token/cookie/密码都会被脱敏。
 - **确认门禁**：写操作走 DSH 的 `tools/pre-execute` → `ask`，由宿主弹确认。**approval 通道不可用时自动拒绝**（fail-closed）。
 - **破坏性操作不放宽**：`delete` 与批量写在任何策略下都要确认。
 - **并发写**：允许子代理写，因此有三重保护 —— 同对象写串行化（`entity:id` 粒度）、乐观并发校验（把上次读到的
@@ -204,12 +226,12 @@ zentao_write(action="update", entity="task", id="18", payload={patch:{pri:1}}, d
 ## 开发
 
 ```bash
-npm test    # 353 项离线测试，不需要禅道
+npm test    # 385 项离线测试，不需要禅道
 ```
 
 ### 两套测试
 
-1. **`npm test`（353 项，自包含）** —— 用 `test/stubs/dsh.mjs` 替换 `@deepseek-ai/*` 与 `zod`，
+1. **`npm test`（385 项，自包含）** —— 用 `test/stubs/dsh.mjs` 替换 `@deepseek-ai/*` 与 `zod`，
    因此**不需要安装 DSH 也能跑**。其中 `test/assembly.test.js` 会真的 import `index.js` 并驱动
    `apply()`，顺带把工具定义当 schema linter 校验；`test/client.test.js` 用**有状态**的 React 桩
    真的渲染三个客户端组件并**驱动交互路径**（保存被接受/被拒绝/抛错/内存模式、看板的会话发现与收起展开），

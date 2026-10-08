@@ -960,3 +960,104 @@ test('includeRawPayload：详情也附带，并能被渲染出来', async () => 
   assert.match(text, /原始载荷/)
   assert.match(text, /已脱敏/)
 })
+
+/* ─────────────── 写后校验的**诚实性**（log_effort 假成功事故的回归）─────────────── */
+
+test('写后校验：服务器"接受了但没改"必须报 verified=false（不能算成功）', async () => {
+  // 真机事故（2026-10-08）：`log_effort` 走 v1 的 /estimate，服务器**完全忽略**了它
+  // （聚合值没变、zt_effort 没有新行），但插件报了 `ok=true verified=true diff=[]` ——
+  // 原因是 consumed/left 不在可比对的字段表里，于是"一个字段都没比对"却被当成通过。
+  const routes = {
+    // 服务器接受请求，但**什么都不改**
+    'POST /tasks/18/estimate': () => ({ json: { id: 18 } }),
+    'GET /tasks/18': () => ({ json: rawTask({ id: 18, execution: 13, status: 'doing', consumed: '1.5', left: '2', name: '工时不动' }) }),
+  }
+  const { service } = makeService({ routes }, { config: { allowUnverifiedWrites: true, writePolicy: 'trusted' } })
+
+  const result = await service.write({
+    action: 'log_effort',
+    entity: 'task',
+    id: '18',
+    payload: { consumed: 9, left: 3, date: '2026-10-08' },
+    dryRun: false,
+  })
+  const item = result.results?.[0] ?? result
+  assert.equal(item.ok, true, '请求确实被服务器接受了')
+  assert.equal(item.verified, false, '服务器没改数据就不能说"已验证"')
+  assert.equal(item.checkedFields, 2, 'consumed/left 必须真的被比对过（两个字段）')
+  assert.match(item.diff.join(' '), /consumed 期望 9 实际 1\.5/)
+  assert.match(item.diff.join(' '), /left 期望 3 实际 2/)
+})
+
+test('写后校验：真的生效的写入仍然报 verified=true（上一条不是把校验关掉）', async () => {
+  const routes = {
+    'PUT /tasks/18': ({ body }) => ({ json: { id: 18, pri: body.pri } }),
+    // 回读时返回**改后**的值
+    'GET /tasks/18': () => ({ json: rawTask({ id: 18, execution: 13, status: 'doing', pri: 1, name: '改过了' }) }),
+  }
+  const { service } = makeService({ routes }, { config: { allowUnverifiedWrites: true, writePolicy: 'trusted' } })
+  const result = await service.write({ action: 'update', entity: 'task', id: '18', payload: { patch: { pri: 1 } }, dryRun: false })
+  const item = result.results?.[0] ?? result
+  assert.equal(item.verified, true)
+  assert.equal(item.checkedFields, 1)
+})
+
+/* ─────────────── 严格 v2-only 相关的两处校验（真机对齐后补的离线回归）─────────────── */
+
+test('状态流转校验：finish 的载荷字段不可比对时，改按**结果状态**校验', async () => {
+  // finish 的载荷是 currentConsumed/finishedDate —— 都不在可比对字段表里。
+  // 只按字段比对会得到 checked=0（"无法确认"）；正确做法是比对结果状态：done。
+  // 注意 v1 的 finish 是 **POST**（v2 注册表里是 PUT，由 v2 方言覆盖）。
+  let phase = 'before'
+  const routes = {
+    'GET /tasks/18': () => ({ json: rawTask({ id: 18, execution: 13, status: phase === 'before' ? 'doing' : 'done', name: 'x', consumed: '0', left: '2' }) }),
+    'POST /tasks/18/finish': () => { phase = 'after'; return { json: { status: 'success' } } },
+  }
+  const { service } = makeService({ routes }, { config: { allowUnverifiedWrites: true, writePolicy: 'trusted' } })
+  const result = await service.write({ action: 'finish', entity: 'task', id: '18', payload: { currentConsumed: 2, finishedDate: '2026-10-08 18:00:00', realStarted: '2026-10-08 09:00:00' }, dryRun: false })
+  const item = result.results?.[0] ?? result
+  assert.equal(item.ok, true, JSON.stringify(item).slice(0, 200))
+  assert.equal(item.verified, true, '状态真的变成 done 就该算验证通过')
+  assert.equal(item.checkedFields, 1, '按结果状态校验：算一项')
+})
+
+test('状态流转校验：状态**没变**时必须报 verified=false 并给出状态差异', async () => {
+  let phase = 'before'
+  const routes = {
+    // 服务器接受请求，但状态始终是 doing
+    'GET /tasks/18': () => ({ json: rawTask({ id: 18, execution: 13, status: 'doing', name: '没变', consumed: '0', left: '2' }) }),
+    'POST /tasks/18/finish': () => { phase = 'after'; return { json: { status: 'success' } } },
+  }
+  const { service } = makeService({ routes }, { config: { allowUnverifiedWrites: true, writePolicy: 'trusted' } })
+  const result = await service.write({ action: 'finish', entity: 'task', id: '18', payload: { currentConsumed: 2, finishedDate: '2026-10-08 18:00:00', realStarted: '2026-10-08 09:00:00' }, dryRun: false })
+  const item = result.results?.[0] ?? result
+  assert.equal(item.verified, false)
+  assert.match(item.diff.join(' '), /status 期望 done 实际 doing/)
+})
+
+test('删除校验：v2 的"对象不存在"（HTTP 200 + status=fail）必须识别成 NOT_FOUND —— 删除成功信号', async () => {
+  // 真机实测：v2 删除后回读得到 200 {"status":"fail","message":"Task does not exist."}。
+  // 若一律当 VALIDATION，删除会被报成"回读校验失败"而不是"已删除"。
+  // 注意：**预读**（写之前读一次当前对象）必须成功，删除后的回读才失败 —— 所以要一个有状态的夹具。
+  let deleted = false
+  const routes = {
+    'DELETE /tasks/18': () => { deleted = true; return { json: { status: 'success', message: '保存成功' } } },
+    'GET /tasks/18': () => (deleted
+      ? { json: { status: 'fail', message: 'Task does not exist.' } }
+      : { json: rawTask({ id: 18, execution: 13, status: 'doing', name: '待删', consumed: '0', left: '2' }) }),
+  }
+  const fake = createFakeTransport(routes, { stripPrefix: '/api.php/v2' })
+  const service = createService({
+    transport: fake.transport,
+    store: createMemoryStore(),
+    locks: new KeyedQueue(),
+    getConfig: () => fakeConfig({ cacheTtlSeconds: 0, dialect: 'rest-v2', allowUnverifiedWrites: true, writePolicy: 'trusted' }),
+    getToken: async () => 'test-token',
+    logger: () => {},
+  })
+  const result = await service.write({ action: 'delete', entity: 'task', id: '18', dryRun: false })
+  const item = result.results?.[0] ?? result
+  assert.equal(item.ok, true, JSON.stringify(item).slice(0, 220))
+  assert.equal(item.verified, true, '回读报"不存在" = 删除成功，应报 verified')
+  assert.match(String(item.note ?? ''), /已删除/)
+})

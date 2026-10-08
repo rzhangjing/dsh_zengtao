@@ -25,11 +25,14 @@ test('命中：200 + 列表信封 → rest-v1', async () => {
     'GET /products': { json: listEnvelope('products', [{ id: 1, name: 'p' }]) },
   })
   const result = await probeDialect({ transport, base: BASE, token: 'tok' })
+  // 探测梯现在是 **v2 优先**：这台假服务器只有 v1 路由（fake 只剥 `/api.php/v1` 前缀），
+  // 所以 v2 候选的三个端点各拿一个 404（共 3 次），第 4 次才是 v1 的产品列表命中。
   assert.equal(result.dialectId, 'rest-v1')
   assert.equal(result.dialectLabel, '禅道 REST v1')
   assert.equal(result.probeVersion, 1)
   assert.ok(result.probedAt)
-  assert.equal(calls.length, 1)
+  assert.equal(calls.length, 3, 'v2 两次探测（v2 没有 me 端点，该步骤被跳过）+ v1 一次命中')
+  assert.match(calls[0].pathname, /^\/api\.php\/v2\//, '先试 v2')
   assert.equal(calls[0].headers.Token, 'tok')
   assert.equal(result.facts.at(-1).outcome, 'hit')
 })
@@ -43,11 +46,15 @@ test('401 → 判为"方言正确、缺凭据"，且**不再往下探**', async 
     (error) => {
       assert.equal(error.code, 'AUTH_REQUIRED')
       assert.match(error.message, /还没有可用的 API Token/)
-      assert.equal(error.facts.probe[0].outcome, 'auth-required')
+      // v2 候选在假服务器上都是 404（shape-mismatch），401 出现在 v1 候选上
+      const authFact = error.facts.probe.find((fact) => fact.outcome === 'auth-required')
+      assert.ok(authFact, '应当记录 auth-required 事实')
       return true
     },
   )
-  assert.equal(calls.length, 1, '401 之后不能再请求别的方言')
+  // 2 次 v2 探测（me 步骤被跳过）+ 1 次 v1（401）——**401 之后不再有任何请求**
+  assert.equal(calls.length, 3, '401 之后不能再请求别的方言')
+  assert.equal(calls.at(-1).status ?? 401, 401)
 })
 
 test('带 token 的 401 → AUTH_EXPIRED', async () => {
@@ -116,7 +123,9 @@ test('401 一旦出现就停止整轮（不降级、不再试其他端点）', a
     assert.equal(error.code, 'AUTH_EXPIRED')
     return true
   })
-  assert.equal(calls.length, 1, '401 之后不该再发任何请求')
+  // v2 两次（404，me 步骤被跳过）+ v1 一次（401）：401 之后没有任何请求（否则 /user 会被试到）
+  assert.equal(calls.length, 3, '401 之后不该再发任何请求')
+  assert.ok(!calls.some((call) => call.matchedPath === '/user'), '不该再试 /user')
 })
 
 test('404 → 换下一档，全败后报 UNSUPPORTED 并带完整事实', async () => {
@@ -125,7 +134,8 @@ test('404 → 换下一档，全败后报 UNSUPPORTED 并带完整事实', async
   })
   await assert.rejects(probeDialect({ transport, base: BASE, token: 'tok' }), (error) => {
     assert.equal(error.code, 'UNSUPPORTED')
-    assert.deepEqual(error.facts.tried, ['rest-v1', 'rest-v2', 'legacy-api'])
+    // 探测梯 **v2 优先**（读更完整、写能力经回退不降级）
+    assert.deepEqual(error.facts.tried, ['rest-v2', 'rest-v1', 'legacy-api'])
     assert.equal(error.facts.probe[0].outcome, 'shape-mismatch')
     assert.equal(error.facts.probe[0].status, 404)
     // 未实现的方言被跳过但记录在案
@@ -140,7 +150,8 @@ test('打到 HTML 登录页 → 记为 html-response（诊断里能看出"打到
   })
   await assert.rejects(probeDialect({ transport, base: BASE, token: 'tok' }), (error) => {
     assert.equal(error.code, 'UNSUPPORTED')
-    assert.equal(error.facts.probe[0].outcome, 'html-response')
+    // v2 候选在假服务器上是 404，打到网页的是 v1 候选
+    assert.ok(error.facts.probe.some((fact) => fact.outcome === 'html-response'))
     return true
   })
 })

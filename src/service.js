@@ -12,7 +12,7 @@
 import { CODES, ZenTaoError, asZenTaoError, redact } from './domain/errors.js'
 import {
   ENTITIES, ENTERPRISE_ENTITY_KEYS, ENTITY_KEYS, entityOf, writeActionOf,
-  WRITE_CREATE_FIELDS, WRITE_UPDATE_FIELDS,
+  WRITE_CREATE_FIELDS, WRITE_UPDATE_FIELDS, TRANSITION_STATUS,
 } from './domain/model.js'
 import {
   normalizeItem, pickArray, pickPageMeta, toId,
@@ -21,7 +21,7 @@ import {
   applyProjection, filterItems, normalizeFilters, normalizeOrderBy, paginateLocally, sortItems,
 } from './domain/query.js'
 import { checkVersion, objectKey } from './domain/locks.js'
-import { describeProbe, probeDialect, PROBE_VERSION } from './transport/probe.js'
+import { describeProbe, fetchServerVersion, probeDialect, PROBE_VERSION } from './transport/probe.js'
 import { dialectOf } from './transport/dialects/index.js'
 import { extractErrorMessage, looksLikeHtml } from './transport/client.js'
 
@@ -84,16 +84,31 @@ function todayIso (date = new Date()) {
  * @param {() => void} [deps.onAuthFailure] 收到 401 时回调：用来丢掉已缓存的 Token，下次自动重换
  * @param {() => Promise<object>} [deps.describeAuth] 诊断用：报告账号/密码凭据是否配置（**不含值**）
  * @param {() => Array<{area: string, message: string}>} [deps.getStartupFailures] 诊断用：启动期注册失败清单
+ * @param {() => Promise<string|undefined>} [deps.getAccount] 凭据里的账号（v2 用它做「我是谁」）
  */
 export function createService (deps) {
   const { transport, store, locks, getConfig, getToken, getSessionContext } = deps
   const onAuthFailure = typeof deps.onAuthFailure === 'function' ? deps.onAuthFailure : () => {}
   const describeAuth = deps.describeAuth
   const getStartupFailures = deps.getStartupFailures
+  // 凭据里的账号：v2 没有「当前用户」端点，用它做身份（避免为此回退 v1）
+  const getAccount = deps.getAccount
   const log = deps.logger ?? (() => {})
 
   /** 方言实例缓存（探测结论变了就重建）。 */
   let dialectCache
+  /** 权威服务器版本（`GET /?mode=getconfig`）按 baseURL 缓存；v2 的动作级版本门禁要用它。 */
+  const versionCache = new Map()
+
+  /** 只有 v2 需要版本（v1 的路径不按版本分支），所以其余方言不额外发这次请求。 */
+  async function versionFor (id, config) {
+    if (id !== 'rest-v2') return undefined
+    const cached = versionCache.get(config.baseURL)
+    if (cached !== undefined) return cached
+    const version = await fetchServerVersion({ transport, base: config.baseURL })
+    if (version !== undefined) versionCache.set(config.baseURL, version)
+    return version
+  }
 
   async function resolveDialect () {
     const config = getConfig()
@@ -102,7 +117,7 @@ export function createService (deps) {
     }
     if (config.dialect !== 'auto') {
       if (dialectCache?.id === config.dialect && dialectCache.base === config.baseURL) return dialectCache
-      const instance = dialectOf(config.dialect, { base: config.baseURL })
+      const instance = dialectOf(config.dialect, { base: config.baseURL, version: await versionFor(config.dialect, config), avoidV1: config.avoidV1 === true })
       dialectCache = Object.assign(instance, { base: config.baseURL })
       return dialectCache
     }
@@ -115,7 +130,7 @@ export function createService (deps) {
       && cached.dialectId
     ) {
       if (dialectCache?.id === cached.dialectId && dialectCache.base === config.baseURL) return dialectCache
-      const instance = dialectOf(cached.dialectId, { base: config.baseURL })
+      const instance = dialectOf(cached.dialectId, { base: config.baseURL, version: await versionFor(cached.dialectId, config), avoidV1: config.avoidV1 === true })
       dialectCache = Object.assign(instance, { base: config.baseURL, probe: cached })
       return dialectCache
     }
@@ -125,9 +140,13 @@ export function createService (deps) {
       base: config.baseURL,
       token: await getToken(),
       configured: 'auto',
+      // ⚠️ 严格 v2-only：`auto` 探测**不能**落到 v1 —— 否则 avoidV1 形同虚设
+      // （方言解析成 v1 之后，v1 方言根本不知道 avoidV1 这回事，请求就真的打到 /api.php/v1 了）。
+      // 所以把候选收窄成只剩 v2；服务器没有 v2 时会以 UNSUPPORTED 明确失败。
+      order: config.avoidV1 === true ? ['rest-v2'] : undefined,
     })
     await store.setProbe({ ...result, baseURL: config.baseURL, probeVersion: PROBE_VERSION })
-    const instance = dialectOf(result.dialectId, { base: config.baseURL })
+    const instance = dialectOf(result.dialectId, { base: config.baseURL, version: await versionFor(result.dialectId, config), avoidV1: config.avoidV1 === true })
     dialectCache = Object.assign(instance, { base: config.baseURL, probe: result })
     return dialectCache
   }
@@ -183,6 +202,12 @@ export function createService (deps) {
     return `${root}${prefix}`
   }
 
+  /** 用**显式基址前缀**拼基址（`spec.basePath` 覆盖、以及 Token 固定走 v1 都用它）。 */
+  function apiBaseOf (prefix, config) {
+    const root = String(config.baseURL ?? '').replace(/\/+$/, '')
+    return `${root}${prefix ?? ''}`
+  }
+
   /**
    * 发一个已认证请求，并把非 2xx / 业务错误 / "根本不是接口"统一抛成 ZenTaoError。
    *
@@ -191,8 +216,19 @@ export function createService (deps) {
    */
   async function call ({ dialect, spec, token, what, signal, expectJson = true }) {
     const config = getConfig()
+    // `spec.basePath` 是**按调用**覆盖基址的逃生口：v2 方言里那些 v2 注册表没有的能力
+    // （当前用户、注册表缺 get 的实体等）回退到 v1 已校准端点时，就靠它把这一次请求指回 v1。
+    // ⚠️ 严格 v2-only（`avoidV1`）下**不允许**任何 v1 请求 —— 这里直接拦住，防"悄悄回退"。
+    if (spec.basePath !== undefined && config.avoidV1 === true) {
+      throw new ZenTaoError(
+        CODES.UNSUPPORTED,
+        `strict v2-only：这次「${what}」需要回退 REST v1（${spec.basePath}），已被 avoidV1 关闭。` +
+        '请改用 v2 支持的动作，或在设置页关掉 avoidV1。',
+        { facts: { basePath: spec.basePath } },
+      )
+    }
     const response = await transport.request({
-      base: apiBase(dialect, config),
+      base: spec.basePath === undefined ? apiBase(dialect, config) : apiBaseOf(spec.basePath, config),
       method: spec.method,
       path: spec.path,
       query: spec.query,
@@ -221,9 +257,14 @@ export function createService (deps) {
 
     const businessError = dialect.detectBusinessError(response.json)
     if (businessError) {
-      throw new ZenTaoError(CODES.VALIDATION, `${what}被禅道拒绝：${businessError}`, {
-        facts: { url: response.url },
-      })
+      // ⚠️ 真机教训：v2 对"对象不存在"也是 **HTTP 200 + `{status:'fail',message:'Task does not exist.'}`**。
+      // 一律当 VALIDATION 的话，删除后的回读会被判成"校验失败"而不是"对象已不可读（删除成功）"——
+      // 而删除校验正是靠 `NOT_FOUND` 这个信号判定成功的（见写路径 ④a）。
+      const missing = /does not exist|not found|不存在|已被删除/i.test(String(businessError))
+      throw new ZenTaoError(missing ? CODES.NOT_FOUND : CODES.VALIDATION,
+        `${what}${missing ? '找不到目标' : '被禅道拒绝'}：${businessError}`, {
+          facts: { url: response.url },
+        })
     }
 
     // 2xx、不是网页、也不是任何合法 JSON：同样不能当成"空结果"。
@@ -509,6 +550,25 @@ export function createService (deps) {
     const cached = await store.getEntity('user', 'me')
     if (cached && ttl > 0 && nowMs() - cached.at < ttl) return cached.item
     const dialect = await resolveDialect()
+
+    // **v2 没有"当前用户"端点**（实测 `/v2/user` 返回 200 空体），而且**不需要**：
+    // 账号本来就在凭据里（官方 SDK 也是把登录时的账号存进 profile）。
+    // 严格 v2-only 下这一步绝不能去发 v1 的 `/user`。
+    if (dialect.meSpec() === undefined) {
+      const account = typeof getAccount === 'function' ? await getAccount() : undefined
+      if (account === undefined || String(account).trim() === '') {
+        throw new ZenTaoError(
+          CODES.AUTH_REQUIRED,
+          '无法确定当前账号：本方言没有"当前用户"端点，而凭据里也没有账号。',
+          { hint: '请在设置页填写禅道账号（凭据库），或改用 rest-v1 方言。' },
+        )
+      }
+      const item = normalizeItem('user', { account: String(account).trim() }, { excerptMode: 'strip' })
+      item.identity = { id: undefined, account: String(account).trim(), realname: undefined }
+      await store.setEntity('user', 'me', { at: nowMs(), item })
+      return item
+    }
+
     const token = await authHeaders()
     const response = await call({ dialect, spec: dialect.meSpec(), token, what: '读取当前用户', signal })
     const raw = dialect.parseItem('user', response.json)
@@ -941,7 +1001,16 @@ export function createService (deps) {
     return actionSpec
   }
 
-  /** 可校验字段的对照：只有这几项能可靠地做写后比对（字段名映射明确）。 */
+  /**
+   * 可校验字段的对照：只有这几项能可靠地做写后比对（字段名映射明确）。
+   *
+   * ⚠️ 真机教训（2026-10-08）：`consumed` / `left` 原先**不在**这张表里，于是
+   * `log_effort`（patch 只有 consumed/left/date）**没有任何字段被校验** → diff 为空 →
+   * 被当成"已验证"。而实测服务器会**完全忽略**那次写入（聚合值没变、`zt_effort` 没有新行），
+   * 插件却报 `ok=true verified=true` —— 典型的**假成功**。两处一起修：
+   *   ① 补上 consumed / left / estimate 的读取；
+   *   ② `verified` 一律要求"至少真的比对了一个字段"（见 verifyAgainst 的 checked）。
+   */
   const VERIFIABLE = Object.freeze({
     status: (item) => item.statusCode,
     assignedTo: (item) => item.assignee?.name,
@@ -951,21 +1020,31 @@ export function createService (deps) {
     title: (item) => item.title,
     name: (item) => item.title,
     resolution: (item) => item.extra?.resolution,
+    consumed: (item) => item.consumed,
+    left: (item) => item.left,
+    estimate: (item) => item.estimate,
   })
 
+  /**
+   * 写后比对。
+   * @returns {{diff: string[], checked: number}} `checked` 是**真正比对过的字段数** ——
+   *   为 0 时调用方**不得**声称 verified（否则就是"没验证却报验证通过"）。
+   */
   function verifyAgainst (payload, item) {
     const patch = payload?.patch ?? payload ?? {}
     const diff = []
+    let checked = 0
     for (const [key, expected] of Object.entries(patch)) {
       const read = VERIFIABLE[key]
       if (!read) continue
+      checked += 1
       const actual = read(item)
       const normalize = (value) => (value === undefined || value === null ? '' : String(value).toLowerCase())
       if (normalize(actual) !== normalize(expected)) {
         diff.push(`${key} 期望 ${expected} 实际 ${actual ?? '（未返回）'}`)
       }
     }
-    return diff
+    return { diff, checked }
   }
 
   function extractCreatedId (json, entity) {
@@ -1179,7 +1258,12 @@ export function createService (deps) {
         }
       }
 
-      const diff = readback ? verifyAgainst(enrichedPayload, readback) : []
+      // ⚠️ `diff` 必须是**可变的**：下面的"按结果状态校验"在状态不符时要往里写差异
+      // （这里曾用 `const { diff, checked } = …` 解构，于是状态不符时抛
+      //  "Assignment to constant variable" —— 被新增的负向测试当场抓到）。
+      const verification = readback ? verifyAgainst(enrichedPayload, readback) : { diff: [], checked: 0 }
+      let diff = verification.diff
+      const checked = verification.checked
 
       // ④b 备注（comment）走的是"PUT 详情带 comment 字段"这条**推断**出来的形状。
       // 实测：真实禅道接受了这个 PUT，但**没有产生任何动作记录**（actions 里没有新的备注条）——
@@ -1203,6 +1287,22 @@ export function createService (deps) {
       await store.setIdempotency(idemKey, { at: nowMs(), resultRef: newId })
       await store.setEntity(entity, String(newId ?? id), { at: nowMs(), item: readback })
 
+      let checkedFinal = checked
+      if (checked === 0 && readback?.statusCode !== undefined) {
+        // 载荷字段没有可校验项（finish/close/resolve…）→ 改按**结果状态**校验。
+        // 只对实测校准过的组合生效（TRANSITION_STATUS），没有证据的组合保持"无法确认"。
+        const expected = TRANSITION_STATUS[`${entity}:${action}`]
+        if (expected !== undefined) {
+          checkedFinal = 1
+          if (String(readback.statusCode) !== expected) {
+            diff = [`status 期望 ${expected} 实际 ${readback.statusCode}`]
+          }
+        }
+      }
+
+      await store.setIdempotency(idemKey, { at: nowMs(), resultRef: newId })
+      await store.setEntity(entity, String(newId ?? id), { at: nowMs(), item: readback })
+
       return {
         ok: true,
         idempotent: false,
@@ -1210,8 +1310,16 @@ export function createService (deps) {
         title: readback?.title ?? current?.title,
         url: readback?.url,
         diff,
-        verified: readback !== undefined,
-        note: readback === undefined ? '写入已完成，但未能回读校验。' : undefined,
+        // ⚠️ **verified 必须要求"至少真的比对过一个字段（或结果状态）"**：`log_effort` 的载荷只有
+        // consumed/left/date，原先这些字段不在可比对表里 → checked=0 → 却报了 verified=true，
+        // 而真机上服务器**完全忽略**了那次写入 —— 典型假成功。
+        verified: readback !== undefined && checkedFinal > 0 && diff.length === 0,
+        checkedFields: checkedFinal,
+        note: readback === undefined
+          ? '写入已完成，但未能回读校验。'
+          : (checkedFinal === 0
+            ? '写入请求已被禅道接受；但该动作的字段**都不在做写后比对的字段表里**，因此无法确认改动是否真的生效 —— 请到禅网上复核。'
+            : undefined),
       }
     })
   }
@@ -1289,10 +1397,19 @@ export function createService (deps) {
     if (!account || !password) {
       throw new ZenTaoError(CODES.VALIDATION, '换取 Token 需要 account 与 password。')
     }
-    const dialect = await resolveDialect()
-    const spec = dialect.tokenSpec(account, password)
+    // ⚠️ **取 Token 不能依赖 `resolveDialect()`** —— 否则在 `dialect: auto` 下会**死锁**：
+    //     resolveDialect → probeDialect（探测要带 Token）→ getToken → exchangeToken → resolveDialect → …
+    // 真机症状：`doctor` 永不返回（Node 报 unsettled top-level await）。
+    // 所以这里按**配置**直接选登录方言（不探测，因此不会死锁）：
+    //   · `rest-v2` 或 `avoidV1: true` → v2 的登录端点（官方 SDK 用的就是它）：
+    //     `POST /api.php/v2/users/login {account,password}` → `{status,token,user}`（实测）
+    //   · 其它（v1 / legacy / auto）→ v1 的 `POST /tokens`（v1 换来的 Token 对 v2 请求同样有效）
+    const config = getConfig()
+    const tokenDialectId = (config.avoidV1 === true || config.dialect === 'rest-v2') ? 'rest-v2' : 'rest-v1'
+    const loginDialect = dialectOf(tokenDialectId, { base: config.baseURL })
+    const spec = loginDialect.tokenSpec(account, password)
     const response = await transport.request({
-      base: apiBase(dialect, getConfig()),
+      base: apiBase(loginDialect, config),
       method: spec.method,
       path: spec.path,
       body: spec.body,
@@ -1300,7 +1417,7 @@ export function createService (deps) {
       signal,
     })
     if (!response.ok) {
-      const error = dialect.parseError(response, { what: '换取 Token' })
+      const error = loginDialect.parseError(response, { what: '换取 Token' })
       // 真实观测（禅道 IPD 集成运行环境）：账号或密码不对时 `POST /tokens` 返回
       // **400**，响应体是 `{"error":"登录失败，请检查您的用户名或密码是否填写正确。"}`，
       // 不是文档暗示的 401。这条 hint 直接说清，省去用户排查 Token 为什么"无效"。

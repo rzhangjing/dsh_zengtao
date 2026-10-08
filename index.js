@@ -16,7 +16,7 @@ import { Transport } from './src/transport/client.js'
 import { KeyedQueue } from './src/domain/locks.js'
 import { createService } from './src/service.js'
 import { createStore } from './src/store.js'
-import { createTokenSource, describeAuth, registerAuthorizationFlow } from './src/auth.js'
+import { createTokenSource, describeAuth, registerAuthorizationFlow, resolveAccount } from './src/auth.js'
 import { registerTools } from './src/tools.js'
 import { registerWriteGuard } from './src/guard.js'
 import { registerCommands } from './src/commands.js'
@@ -59,6 +59,8 @@ export function apply (ctx, config) {
     onAuthFailure: () => tokenSource?.invalidate(),
     describeAuth: () => describeAuth(ctx, getConfig()),
     getStartupFailures: () => startupFailures,
+    // v2 没有「当前用户」端点，账号来自凭据（严格 v2-only 下不发 v1 请求）
+    getAccount: () => resolveAccount(ctx, getConfig()),
     // 单站点 + 会话上下文：工具省略 scope 时用 `/zentao switch` 设过的产品/执行补全
     getSessionContext: () => sessionContext.get(currentSessionId(ctx)),
     logger: log,

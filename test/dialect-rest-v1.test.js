@@ -316,8 +316,25 @@ test('网页深链与方言注册表', () => {
 
   assert.equal(dialectOf('rest-v1').implemented, true)
   assert.equal(dialectOf('legacy-api').implemented, false)
-  assert.equal(dialectOf('rest-v2').implemented, false)
+  // v2 已经实现（路径来自官方 SDK 注册表）；它的行为由 dialect-rest-v2.test.js 覆盖
+  assert.equal(dialectOf('rest-v2').implemented, true)
   assert.throws(() => dialectOf('nope'), /未知 dialect/)
+})
+
+test('v1：**v2 专属动作**（activate / confirm）明确报不支持，并指出该怎么做', () => {
+  // 实测：v1 的 PUT /tasks/:id/activate 与 /stories/:id/activate 都是 404；
+  //       PUT /bugs/:id/confirm 返回 200 但响应体为空 —— 不可信，所以不在 v1 开放
+  for (const action of ['activate', 'confirm']) {
+    assert.throws(
+      () => dialect.writeSpec(action, { entity: action === 'confirm' ? 'bug' : 'task', id: '3', payload: {} }),
+      (error) => {
+        assert.equal(error.code, 'UNSUPPORTED')
+        assert.match(error.message, /REST v1 没有/)
+        assert.match(error.message, /rest-v2/, '要告诉用户改用 v2')
+        return true
+      },
+    )
+  }
 })
 
 test('网页深链的**模块名**必须与禅道真实模块一致（15/15 已在本机实测）', () => {
